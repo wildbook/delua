@@ -1,8 +1,4 @@
-use std::{
-    hash::Hash,
-    io::Read,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use std::{hash::Hash, io::Read};
 
 type Result<T> = std::result::Result<T, std::io::Error>;
 
@@ -21,14 +17,6 @@ pub struct LuaHeader {
 
 impl LuaHeader {
     const MAGIC: &'static [u8; 4] = b"\x1BLua";
-
-    pub fn major_version(&self) -> u8 {
-        self.version >> 4
-    }
-
-    pub fn minor_version(&self) -> u8 {
-        self.version & 0xF
-    }
 }
 
 impl LuaHeader {
@@ -156,15 +144,13 @@ impl<'a> std::fmt::Display for LuaNumber {
 
 impl LuaReader for LuaNumber {
     fn read<R: Read>(buffer: &mut R, header: &LuaHeader) -> Result<Self> {
-        Ok(LuaNumber(
-            match (header.integral_flag, header.lua_number_size) {
-                (IntegralType::FloatingPoint, 4) => f32::read(buffer, header)? as f64,
-                (IntegralType::FloatingPoint, 8) => f64::read(buffer, header)? as f64,
-                (IntegralType::IntegralNumber, 4) => u32::read(buffer, header)? as f64,
-                (IntegralType::IntegralNumber, 8) => u64::read(buffer, header)? as f64,
-                _ => panic!("failed to parse LuaNumber"),
-            },
-        ))
+        Ok(LuaNumber(match (header.integral_flag, header.lua_number_size) {
+            (IntegralType::FloatingPoint, 4) => f32::read(buffer, header)? as f64,
+            (IntegralType::FloatingPoint, 8) => f64::read(buffer, header)? as f64,
+            (IntegralType::IntegralNumber, 4) => u32::read(buffer, header)? as f64,
+            (IntegralType::IntegralNumber, 8) => u64::read(buffer, header)? as f64,
+            _ => panic!("failed to parse LuaNumber"),
+        }))
     }
 }
 
@@ -272,42 +258,21 @@ impl LuaReader for LuaDebugInfo {
     }
 }
 
-#[derive(Debug, Eq, PartialEq, Hash, Copy, Clone)]
-pub struct LuaConstantId(pub u64);
-
-impl LuaConstantId {
-    pub fn new() -> LuaConstantId {
-        static INC: AtomicU64 = AtomicU64::new(0);
-        LuaConstantId(INC.fetch_add(1, Ordering::AcqRel))
-    }
-}
-
 #[derive(Debug, PartialEq, Clone)]
 pub enum LuaConstant {
-    Nil(LuaConstantId),
-    Bool(LuaConstantId, bool),
-    Number(LuaConstantId, LuaNumber),
-    String(LuaConstantId, LuaString),
-}
-
-impl LuaConstant {
-    pub fn id(&self) -> LuaConstantId {
-        *match self {
-            LuaConstant::Nil(id) => id,
-            LuaConstant::Bool(id, _) => id,
-            LuaConstant::Number(id, _) => id,
-            LuaConstant::String(id, _) => id,
-        }
-    }
+    Nil,
+    Bool(bool),
+    Number(LuaNumber),
+    String(LuaString),
 }
 
 impl<'a> std::fmt::Display for LuaConstant {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LuaConstant::Nil(_) => write!(f, "Nil"),
-            LuaConstant::Bool(_, x) => write!(f, "{}", x),
-            LuaConstant::Number(_, x) => write!(f, "{}", x),
-            LuaConstant::String(_, x) => write!(f, "\"{}\"", x),
+            LuaConstant::Nil => write!(f, "Nil"),
+            LuaConstant::Bool(x) => write!(f, "{}", x),
+            LuaConstant::Number(x) => write!(f, "{}", x),
+            LuaConstant::String(x) => write!(f, "\"{}\"", x),
         }
     }
 }
@@ -315,10 +280,10 @@ impl<'a> std::fmt::Display for LuaConstant {
 impl LuaReader for LuaConstant {
     fn read<R: Read>(buffer: &mut R, header: &LuaHeader) -> Result<Self> {
         Ok(match u8::read(buffer, header)? {
-            0 => Self::Nil(LuaConstantId::new()),
-            1 => Self::Bool(LuaConstantId::new(), u8::read(buffer, header)? != 0),
-            3 => Self::Number(LuaConstantId::new(), LuaNumber::read(buffer, header)?),
-            4 => Self::String(LuaConstantId::new(), LuaString::read(buffer, header)?),
+            0 => Self::Nil,
+            1 => Self::Bool(u8::read(buffer, header)? != 0),
+            3 => Self::Number(LuaNumber::read(buffer, header)?),
+            4 => Self::String(LuaString::read(buffer, header)?),
             x => panic!("failed to parse LuaConstant: {}", x),
         })
     }
@@ -399,10 +364,7 @@ impl LuaFile {
         let header = LuaHeader::read(buffer)?;
         dbg!(header);
         let top_level_func = LuaFunction::read(buffer, &header)?;
-        Ok(Self {
-            header,
-            top_level_func,
-        })
+        Ok(Self { header, top_level_func })
     }
 }
 
