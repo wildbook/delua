@@ -1,4 +1,4 @@
-use std::collections::{hash_map, HashMap};
+use std::collections::{hash_map, HashMap, HashSet};
 
 use itertools::Itertools;
 use shrinkwraprs::Shrinkwrap;
@@ -9,24 +9,36 @@ pub trait OpInfo {
     fn text(&self, constants: &[LiftedConstant]) -> String;
     fn arguments_read(&self) -> Vec<Arg>;
     fn arguments_write(&self) -> Vec<Arg>;
-    fn next(&self, addr: usize) -> Vec<usize>;
+    fn next(&self, addr: usize) -> Vec<InstructionRef>;
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
-pub enum CustomOpCode {
+pub enum ExtOpCode {
     Closure(Arg, Arg, Vec<Arg>),
     Comment(String),
     Nop,
 }
 
-impl OpInfo for CustomOpCode {
+impl ExtOpCode {
+    pub fn comment(str: impl Into<String>) -> ExtOpCode {
+        ExtOpCode::Comment(str.into())
+    }
+}
+
+impl From<ExtOpCode> for OpCode {
+    fn from(val: ExtOpCode) -> Self {
+        OpCode::Custom(val)
+    }
+}
+
+impl OpInfo for ExtOpCode {
     fn text(&self, constants: &[LiftedConstant]) -> String {
         let _text = |a: Arg| a.text(constants);
 
         match self {
-            CustomOpCode::Nop => "NOP".to_string(),
-            CustomOpCode::Comment(str) => format!("-- COMMENT: {}", str),
-            CustomOpCode::Closure(into, cidx, args) => {
+            ExtOpCode::Nop => String::new(),
+            ExtOpCode::Comment(str) => format!("--[[ {} ]]", str),
+            ExtOpCode::Closure(into, cidx, args) => {
                 format!("{} = CreateClosure({}, [{}])", into, cidx, args.iter().join(","))
             },
         }
@@ -34,22 +46,22 @@ impl OpInfo for CustomOpCode {
 
     fn arguments_read(&self) -> Vec<Arg> {
         match self {
-            CustomOpCode::Nop => vec![],
-            CustomOpCode::Comment(_) => vec![],
-            CustomOpCode::Closure(_, _, _) => vec![],
+            ExtOpCode::Nop => vec![],
+            ExtOpCode::Comment(_) => vec![],
+            ExtOpCode::Closure(_, _, _) => vec![],
         }
     }
 
     fn arguments_write(&self) -> Vec<Arg> {
         match self {
-            CustomOpCode::Nop => vec![],
-            CustomOpCode::Comment(_) => vec![],
-            CustomOpCode::Closure(into, _, _) => vec![*into],
+            ExtOpCode::Nop => vec![],
+            ExtOpCode::Comment(_) => vec![],
+            ExtOpCode::Closure(into, _, _) => vec![*into],
         }
     }
 
-    fn next(&self, addr: usize) -> Vec<usize> {
-        let skip = |off: i32| (addr as i32 + off + 1) as usize;
+    fn next(&self, addr: usize) -> Vec<InstructionRef> {
+        let skip = |off: i32| InstructionRef::Instruction((addr as i32 + off + 1) as usize);
         vec![skip(0)]
     }
 }
@@ -95,7 +107,7 @@ pub enum OpCode {
     Closure(Arg, Arg),
     Vararg(Arg, Arg),
 
-    Custom(CustomOpCode),
+    Custom(ExtOpCode),
 }
 
 impl OpInfo for OpCode {
@@ -217,15 +229,15 @@ impl OpInfo for OpCode {
         }
     }
 
-    fn next(&self, addr: usize) -> Vec<usize> {
-        let skip = |off: i32| (addr as i32 + off + 1) as usize;
+    fn next(&self, addr: usize) -> Vec<InstructionRef> {
+        let skip = |off: i32| InstructionRef::Instruction((addr as i32 + off + 1) as usize);
 
         match self {
-            OpCode::LoadBool(_, _, c) => match c.as_value().unwrap() {
+            &OpCode::LoadBool(_, _, Arg::Value(c)) => match c {
                 0 => vec![skip(0)],
                 _ => vec![skip(1)],
             },
-            OpCode::Jmp(a) => vec![skip(a.as_signed_value().unwrap() as _)],
+            &OpCode::Jmp(Arg::SignedValue(a)) => vec![skip(a as _)],
             OpCode::Equals(Arg::Value(0), Arg::Constant(b), Arg::Constant(c)) if b == c => {
                 vec![skip(0)]
             },
@@ -240,7 +252,7 @@ impl OpInfo for OpCode {
             &OpCode::ForLoop(_, Arg::SignedValue(sbx)) => vec![skip(0), skip(sbx as _)],
             &OpCode::ForPrep(_, Arg::SignedValue(sbx)) => vec![skip(sbx as _)],
             OpCode::TForLoop(_, _) => vec![skip(0), skip(1)],
-            OpCode::Return(_, _) => vec![],
+            OpCode::Return(_, _) => vec![InstructionRef::FunctionExit],
             _ => vec![skip(0)],
         }
     }
@@ -376,19 +388,23 @@ impl std::fmt::Display for ConstantId {
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Arg {
+    Top,
+    Register(u32),
+    UpValue(u32),
     Value(u32),
     SignedValue(i32),
     Constant(ConstantId),
     FnConstant(u32),
-    Register(u32),
     Global(ConstantId),
-    UpValue(u32),
-    Top,
 }
 
 impl Arg {
+    pub fn is_reg(&self) -> bool {
+        matches!(self, Arg::Register(_))
+    }
+
     pub fn text(&self, consts: &[LiftedConstant]) -> String {
         match self {
             Arg::Constant(x) => match consts.get(x.0 as usize) {
@@ -400,51 +416,6 @@ impl Arg {
                 None => format!("_G[{}]", x),
             },
             x => x.to_string(),
-        }
-    }
-}
-
-impl Arg {
-    pub fn as_value(&self) -> Option<u32> {
-        match *self {
-            Arg::Value(x) => Some(x),
-            _ => None,
-        }
-    }
-    pub fn as_signed_value(&self) -> Option<i32> {
-        match *self {
-            Arg::SignedValue(x) => Some(x),
-            _ => None,
-        }
-    }
-    pub fn as_constant(&self) -> Option<ConstantId> {
-        match *self {
-            Arg::Constant(x) => Some(x),
-            _ => None,
-        }
-    }
-    pub fn as_fn_constant(&self) -> Option<u32> {
-        match *self {
-            Arg::FnConstant(x) => Some(x),
-            _ => None,
-        }
-    }
-    pub fn as_register(&self) -> Option<u32> {
-        match *self {
-            Arg::Register(x) => Some(x),
-            _ => None,
-        }
-    }
-    pub fn as_global(&self) -> Option<ConstantId> {
-        match *self {
-            Arg::Global(x) => Some(x),
-            _ => None,
-        }
-    }
-    pub fn as_up_value(&self) -> Option<u32> {
-        match *self {
-            Arg::UpValue(x) => Some(x),
-            _ => None,
         }
     }
 }
@@ -477,16 +448,39 @@ impl<'a> Arg {
     }
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Ord, PartialOrd)]
+pub enum InstructionRef {
+    FunctionEntry,
+    Instruction(usize),
+    FunctionExit,
+}
+
+impl std::fmt::Display for InstructionRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InstructionRef::FunctionEntry => write!(f, "FunctionEntry"),
+            InstructionRef::Instruction(idx) => idx.fmt(f),
+            InstructionRef::FunctionExit => write!(f, "FunctionExit"),
+        }
+    }
+}
+
+impl InstructionRef {
+    pub fn is_instruction_idx(&self) -> bool {
+        matches!(self, InstructionRef::Instruction(_))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Instruction<'a> {
     raw: &'a raw::LuaInstruction,
     fun: IgnoreDebug<&'a raw::LuaFunction>,
 
-    pub addr: usize,
+    pub addr: InstructionRef,
     pub op_code: OpCode,
 
-    pub src: Vec<usize>,
-    pub dst: Vec<usize>,
+    pub src: Vec<InstructionRef>,
+    pub dst: Vec<InstructionRef>,
 }
 
 impl<'a> Instruction<'a> {
@@ -582,7 +576,7 @@ impl<'a> Instruction<'a> {
         Instruction {
             raw: i,
             fun: IgnoreDebug(f),
-            addr,
+            addr: InstructionRef::Instruction(addr),
             src: vec![],
             dst: op_code.next(addr),
             op_code,
@@ -592,7 +586,7 @@ impl<'a> Instruction<'a> {
 
 impl<'a> std::fmt::Display for Instruction<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "[{:#x}] {}", self.addr, self.op_code)
+        write!(f, "[{}] {}", self.addr, self.op_code)
     }
 }
 
@@ -614,18 +608,27 @@ impl<'a> Function<'a> {
             .map(|(index, i)| Instruction::parse(&raw, i, index))
             .collect::<Vec<_>>();
 
-        let mut jumps: HashMap<usize, Vec<usize>> = HashMap::default();
+        let mut jumps: HashMap<InstructionRef, Vec<InstructionRef>> = HashMap::default();
 
+        log::debug!("|instructions");
         for i in instructions.iter() {
+            log::debug!("{:#}", i);
+
             for &target in i.dst.iter() {
                 jumps.entry(target).or_default().push(i.addr);
             }
         }
 
         for (addr, dst) in jumps.into_iter() {
-            for target in dst {
-                instructions[addr].src.push(target);
+            if let InstructionRef::Instruction(idx) = addr {
+                for target in dst {
+                    instructions[idx].src.push(target);
+                }
             }
+        }
+
+        if let Some(instr) = instructions.get_mut(0) {
+            instr.src.push(InstructionRef::FunctionEntry);
         }
 
         let prototypes = raw.prototypes.0.iter().map(Function::parse).collect();
@@ -634,16 +637,28 @@ impl<'a> Function<'a> {
         Function { raw, prototypes, instructions, constants }
     }
 
-    pub fn instruction_at(&self, address: usize) -> Option<&Instruction<'a>> {
+    pub fn instruction_at(&self, address: InstructionRef) -> Option<&Instruction<'a>> {
         self.instructions.iter().find(|x| x.addr == address)
     }
 
     pub fn get_src(&self, instr: &Instruction<'a>) -> Vec<&Instruction<'a>> {
-        instr.src.iter().map(|&addr| self.instruction_at(addr).unwrap()).collect()
+        instr
+            .src
+            .iter()
+            .copied()
+            .filter(InstructionRef::is_instruction_idx)
+            .map(|addr| self.instruction_at(addr).unwrap())
+            .collect()
     }
 
     pub fn get_dst(&self, instr: &Instruction<'a>) -> Vec<&Instruction<'a>> {
-        instr.dst.iter().map(|&addr| self.instruction_at(addr).unwrap()).collect()
+        instr
+            .dst
+            .iter()
+            .copied()
+            .filter(InstructionRef::is_instruction_idx)
+            .map(|addr| self.instruction_at(addr).unwrap())
+            .collect()
     }
 
     // Whether or not a function has a "basic" control flow, meaning it only comes from one source
@@ -657,25 +672,29 @@ impl<'a> Function<'a> {
     }
 
     pub fn has_basic_dst(&self, instr: &Instruction<'a>) -> bool {
-        self.basic_dst(instr).is_some()
+        self.get_dst(instr).len() == 1
     }
 
     pub fn basic_dst(&self, instr: &Instruction<'a>) -> Option<&Instruction<'a>> {
-        let dst = self.get_dst(&instr);
-        match (dst.get(0), dst.len()) {
-            (Some(&i), 1) => Some(i),
+        match *self.get_dst(&instr) {
+            [dst] => Some(dst),
             _ => None,
         }
     }
 
-    pub fn blocks(&self) -> HashMap<usize, Block<'_, 'a>> {
+    pub fn blocks(&self) -> HashMap<InstructionRef, Block<'_, 'a>> {
         let mut blocks = HashMap::default();
         let mut trails = vec![match self.instructions.get(0) {
             Some(i) => i,
             None => return HashMap::default(),
         }];
 
+        let mut seen = HashSet::new();
         while let Some(mut instr) = trails.pop() {
+            if !seen.insert(instr.addr) {
+                continue;
+            }
+
             let entry = match blocks.entry(instr.addr) {
                 hash_map::Entry::Occupied(_) => continue,
                 hash_map::Entry::Vacant(x) => x,
@@ -714,8 +733,8 @@ impl<'a> Function<'a> {
 
 #[derive(Clone, Debug)]
 pub struct Block<'f, 'a> {
-    pub addr_start: usize,
-    pub addr_end: usize,
+    pub addr_start: InstructionRef,
+    pub addr_end: InstructionRef,
     pub function: &'f Function<'a>,
     pub instructions: Vec<&'f Instruction<'a>>,
     pub forks_to: Vec<&'f Instruction<'a>>,
@@ -723,14 +742,14 @@ pub struct Block<'f, 'a> {
 
 impl<'f, 'a> std::fmt::Display for Block<'f, 'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "[{:#x?} -> {:#x?}]", self.addr_start, self.addr_end)?;
+        writeln!(f, "[{:#} -> {:#}]", self.addr_start, self.addr_end)?;
 
         for instr in self.instructions.iter() {
             writeln!(f, "  {}", instr)?;
         }
 
         for target in self.forks_to.iter() {
-            writeln!(f, "  -> {:#x?}", target.addr)?;
+            writeln!(f, "  -> {:#}", target.addr)?;
         }
 
         Ok(())

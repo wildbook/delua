@@ -362,7 +362,6 @@ pub struct LuaFile {
 impl LuaFile {
     pub fn read<R: Read>(buffer: &mut R) -> Result<Self> {
         let header = LuaHeader::read(buffer)?;
-        dbg!(header);
         let top_level_func = LuaFunction::read(buffer, &header)?;
         Ok(Self { header, top_level_func })
     }

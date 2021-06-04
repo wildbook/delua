@@ -1,12 +1,16 @@
 #![feature(array_windows)]
+#![feature(map_first_last)]
 
-use std::io::{BufWriter, Cursor, Write};
+use std::{
+    collections::BTreeMap,
+    io::{BufWriter, Cursor, Write},
+};
 
 use itertools::Itertools;
 
 use crate::{
-    lifted::{LiftedBlockId, LiftedFunction},
-    parsed::OpInfo,
+    lifted::LiftedFunction,
+    parsed::{Arg, ExtOpCode, OpInfo},
     raw::LuaFile,
 };
 
@@ -26,21 +30,21 @@ fn escape(s: String) -> String {
         .replace(r"\\l", r"\l")
 }
 
-fn level_1(top: parsed::Function) {
+fn output_parsed_debug(top: parsed::Function) {
     let mut stack = vec![top.clone()];
     while let Some(func) = stack.pop() {
         let block = func.blocks();
-        println!("|blocks");
+        log::debug!("|blocks");
 
         for (_, b) in block.iter().sorted_by_key(|(&a, _)| a) {
-            println!("{:#}", b);
+            log::debug!("{:#}", b);
         }
 
         stack.extend(func.prototypes);
     }
 }
 
-fn level_2(top: parsed::Function) -> Result<(), Box<dyn std::error::Error>> {
+fn output_parsed(top: parsed::Function) -> Result<std::process::Child, Box<dyn std::error::Error>> {
     let mut out = BufWriter::new(std::fs::File::create("output.dot")?);
     writeln!(out, "digraph L {{")?;
 
@@ -51,8 +55,7 @@ fn level_2(top: parsed::Function) -> Result<(), Box<dyn std::error::Error>> {
         writeln!(out, "  node [shape=record fontname=Consolas];")?;
 
         let blocks = func.blocks();
-
-        for (a, block) in blocks.iter() {
+        for (a, block) in blocks {
             let mut code = String::new();
             let mut debug = String::new();
             for instr in block.instructions.iter() {
@@ -61,7 +64,7 @@ fn level_2(top: parsed::Function) -> Result<(), Box<dyn std::error::Error>> {
             }
 
             code = format!(
-                "  \"fn_{}_{:#x}\" [label=\"{}\", tooltip=\"{}\"]",
+                "  fn_{}_{} [label=\"{}\", tooltip=\"{}\"]",
                 i,
                 a,
                 escape(code),
@@ -70,11 +73,11 @@ fn level_2(top: parsed::Function) -> Result<(), Box<dyn std::error::Error>> {
 
             writeln!(out, "{}", code)?;
             for t in block.forks_to.iter() {
-                writeln!(
-                    out,
-                    "\"fn_{}_{:#x}\" -> \"fn_{}_{:#x}\"",
-                    i, block.addr_start, i, t.addr
-                )?;
+                write!(out, "fn_{}_{} -> fn_{}_{} ", i, block.addr_start, i, t.addr)?;
+                match block.addr_start == t.addr {
+                    true => writeln!(out, "[dir=back]")?,
+                    false => writeln!(out)?,
+                }
             }
         }
 
@@ -85,22 +88,84 @@ fn level_2(top: parsed::Function) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     writeln!(out, "}}")?;
+    out.flush()?;
     drop(out);
 
-    std::process::Command::new("dot").arg("output.dot").arg("-O").arg("-Tsvg").spawn()?;
-
-    Ok(())
+    Ok(std::process::Command::new("dot").arg("output.dot").arg("-O").arg("-Tsvg").spawn()?)
 }
 
-fn level_3(top: parsed::Function) -> Result<(), Box<dyn std::error::Error>> {
+fn inject_block_lifetime_comments(lifted: &mut LiftedFunction) {
+    let mut stack_fn = vec![lifted];
+    while let Some(func) = stack_fn.pop() {
+        let consts = &func.constants;
+        let text = move |arg: Arg| arg.text(consts);
+
+        for (_, block) in func.blocks.iter_mut() {
+            let life = match block.lifetime_analysis() {
+                Some(life) => life,
+                None => {
+                    block.push_front([ExtOpCode::comment("LT: ✖ failed ✖")]);
+                    continue;
+                },
+            };
+
+            let mut comments = BTreeMap::<usize, (Vec<String>, Vec<String>)>::new();
+            let mut comment = |create, addr, arg| {
+                let (c, d) = comments.entry(addr).or_default();
+                match create {
+                    true => c.push(format!("LT + {}", text(arg))),
+                    false => d.push(format!("LT - {}", text(arg))),
+                }
+            };
+
+            for v in life.vars {
+                if !v.arg.is_reg() {
+                    continue;
+                }
+
+                if let Some(created) = v.created {
+                    comment(true, created, v.arg);
+                }
+
+                if let Some(deleted) = v.deleted {
+                    comment(false, deleted, v.arg);
+                }
+            }
+
+            let mut offset = 0;
+            for (addr, (created, deleted)) in comments {
+                for comment in deleted.into_iter().sorted() {
+                    let op = ExtOpCode::comment(comment).into();
+                    block.instructions.insert(addr + offset, op);
+                    offset += 1;
+                }
+
+                for comment in created.into_iter().sorted() {
+                    let op = ExtOpCode::comment(comment).into();
+                    block.instructions.insert(addr + offset, op);
+                    offset += 1;
+                }
+            }
+
+            for import in life.imported.into_iter().filter(Arg::is_reg).sorted() {
+                block.push_front([ExtOpCode::comment(format!("LT import {}", text(import)))]);
+            }
+
+            for export in life.exported.into_iter().filter(Arg::is_reg).sorted() {
+                block.push_back([ExtOpCode::comment(format!("LT export {}", text(export)))]);
+            }
+        }
+
+        stack_fn.extend(func.children.iter_mut());
+    }
+}
+
+fn output_lifted(top: parsed::Function) -> Result<std::process::Child, Box<dyn std::error::Error>> {
     let mut lifted = LiftedFunction::lift(top.clone()).with_name("Entrypoint");
 
-    // Run 10 iterations of optimize and exit early if nothing could be optimized
-    for _ in 0..10 {
-        if dbg!(lifted.optimize()) == 0 {
-            break;
-        }
-    }
+    dbg!(lifted.optimize_until_complete());
+
+    inject_block_lifetime_comments(&mut lifted);
 
     let mut out = BufWriter::new(std::fs::File::create("output_lifted.dot")?);
 
@@ -120,9 +185,9 @@ fn level_3(top: parsed::Function) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let blocks = func.blocks;
-        let first_block = Some(LiftedBlockId(0)).filter(|x| blocks.contains_key(x));
+        let first_block = blocks.first_key_value().map(|(id, _)| *id);
 
-        for (block_id, block) in blocks.into_iter() {
+        for (block_id, block) in blocks {
             let mut content = String::new();
             let mut tooltip = String::new();
 
@@ -135,7 +200,7 @@ fn level_3(top: parsed::Function) -> Result<(), Box<dyn std::error::Error>> {
             }
 
             content = format!(
-                "  \"fn_{}_{}\" [label=\"{}\", tooltip=\"{}\"]",
+                "  fn_{}_{} [label=\"{}\", tooltip=\"{}\"]",
                 fn_index,
                 *block_id,
                 escape(content),
@@ -144,11 +209,11 @@ fn level_3(top: parsed::Function) -> Result<(), Box<dyn std::error::Error>> {
 
             writeln!(out, "{}", content)?;
             for t in block.forks_to.iter() {
-                writeln!(
-                    out,
-                    "  \"fn_{}_{}\" -> \"fn_{}_{}\"",
-                    fn_index, *block_id, fn_index, **t
-                )?;
+                write!(out, "  fn_{}_{} -> fn_{}_{} ", fn_index, *block_id, fn_index, **t)?;
+                match *block_id == **t {
+                    true => writeln!(out, "[dir=back]")?,
+                    false => writeln!(out)?,
+                }
             }
         }
 
@@ -163,25 +228,9 @@ fn level_3(top: parsed::Function) -> Result<(), Box<dyn std::error::Error>> {
             writeln!(out, "  protos_{} [label=\"PROTOS\\n──────\\n{}\\l\"]", fn_index, protos)?;
 
             if let Some(first) = first_block {
-                writeln!(out, "protos_{} -> \"fn_{}_{}\"", fn_index, fn_index, *first)?;
+                writeln!(out, "protos_{} -> fn_{}_{}", fn_index, fn_index, *first)?;
             }
         }
-
-        // if !func.constants.is_empty() {
-        //     let consts = escape(
-        //         func.constants.iter().enumerate().map(|(c, v)| format!("{}: {}", c, v)).join("\\l"),
-        //     );
-
-        //     writeln!(
-        //         out,
-        //         "  consts_{} [label=\"CONSTANTS\\n─────────\\n{}\\l\"]",
-        //         fn_index, consts
-        //     )?;
-
-        //     if let Some(first) = first_block {
-        //         writeln!(out, "consts_{} -> \"fn_{}_{}\"", fn_index, fn_index, *first)?;
-        //     }
-        // }
 
         writeln!(out, "}}")?;
 
@@ -190,28 +239,40 @@ fn level_3(top: parsed::Function) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     writeln!(out, "}}")?;
+    out.flush()?;
+
     drop(out);
 
-    std::process::Command::new("dot")
-        .arg("output_lifted.dot")
-        .arg("-O")
-        .arg("-Tsvg")
-        .spawn()?
-        .wait()?;
-
-    Ok(())
+    Ok(std::process::Command::new("dot").arg("output_lifted.dot").arg("-O").arg("-Tsvg").spawn()?)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
     let file = std::env::args().nth(1).unwrap_or_else(|| "aram.luabin".to_string());
+
+    log::info!("reading file to bytes");
     let buffer = std::fs::read(file)?;
     let mut cursor = Cursor::new(buffer);
+
+    log::info!("reading LuaFile");
     let chunk = LuaFile::read(&mut cursor)?;
 
+    log::info!("parsing top level function");
     let top = parsed::Function::parse(&chunk.top_level_func);
-    level_1(top.clone());
-    level_2(top.clone())?;
-    level_3(top.clone())?;
+
+    log::info!("executing output_parsed_debug");
+    output_parsed_debug(top.clone());
+
+    log::info!("executing output_parsed");
+    let gv1 = output_parsed(top.clone())?;
+
+    log::info!("executing output_lifted");
+    let gv2 = output_lifted(top.clone())?;
+
+    log::info!("finished - waiting for graphviz/dot");
+    for mut proc in [gv1, gv2] {
+        proc.wait()?;
+    }
 
     Ok(())
 }

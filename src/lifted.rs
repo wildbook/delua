@@ -1,33 +1,33 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use shrinkwraprs::Shrinkwrap;
 
 use crate::{
-    parsed::{self, Arg, ConstantId, CustomOpCode, OpCode, OpInfo},
+    parsed::{Arg, Block, ExtOpCode, Function, InstructionRef, OpCode, OpInfo},
     raw,
-    util::drop_copy,
+    util::discard,
 };
 
 #[derive(Shrinkwrap, Debug, Eq, PartialEq, Clone, Copy, PartialOrd, Ord, Hash)]
-pub struct LiftedBlockId(pub usize);
+pub struct LiftedBlockId(pub InstructionRef);
 
 #[derive(Debug)]
 pub struct LiftedFunction {
     pub name: Option<String>,
-    pub blocks: HashMap<LiftedBlockId, LiftedBlock>,
+    pub blocks: BTreeMap<LiftedBlockId, LiftedBlock>,
     pub children: Vec<LiftedFunction>,
     pub constants: Vec<LiftedConstant>,
     pub up_val_count: u8,
 }
 
 impl LiftedFunction {
-    pub fn lift(p: parsed::Function<'_>) -> LiftedFunction {
+    pub fn lift(p: Function<'_>) -> LiftedFunction {
         // Generate and lift all blocks
         let blocks = p
             .blocks()
             .into_iter()
             .map(|(id, block)| (LiftedBlockId(id), LiftedBlock::lift(block)))
-            .collect::<HashMap<_, _>>();
+            .collect();
 
         // Lift all constants
         let constants: Vec<_> = p.constants.iter().copied().map(LiftedConstant::lift).collect();
@@ -49,6 +49,10 @@ impl LiftedFunction {
 }
 
 impl LiftedFunction {
+    pub fn optimize_until_complete(&mut self) -> Vec<usize> {
+        (0..).map(|_| self.optimize()).take_while(|&s| s != 0).collect()
+    }
+
     pub fn optimize(&mut self) -> usize {
         self.opt_funcs()
             + self.opt_blocks()
@@ -75,16 +79,14 @@ impl LiftedFunction {
         let mut rename = vec![];
         let mut blocks = HashMap::new();
 
-        for (id, block) in self.blocks.drain() {
+        for (id, block) in std::mem::take(&mut self.blocks) {
             match blocks.entry(block) {
                 Entry::Occupied(exists) => rename.push((id, *exists.get())),
-                Entry::Vacant(empty) => {
-                    empty.insert(id);
-                },
+                Entry::Vacant(empty) => discard(empty.insert(id)),
             }
         }
 
-        self.blocks = blocks.into_iter().map(|(b, id)| (id, b)).collect();
+        self.blocks.extend(blocks.into_iter().map(|(b, id)| (id, b)));
 
         for (ref from, to) in rename {
             for block in self.blocks.values_mut() {
@@ -172,11 +174,14 @@ impl LiftedFunction {
             };
 
             for var in an.vars {
-                let (dst, idx) = match block.instructions[var.created] {
+                let created = match var.created {
+                    Some(created) => created,
+                    None => continue,
+                };
+
+                let (dst, idx) = match block.instructions[created] {
                     OpCode::Closure(dst, Arg::FnConstant(idx)) => (dst, idx),
-                    OpCode::Custom(CustomOpCode::Closure(dst, Arg::FnConstant(idx), _)) => {
-                        (dst, idx)
-                    },
+                    OpCode::Custom(ExtOpCode::Closure(dst, Arg::FnConstant(idx), _)) => (dst, idx),
                     _ => continue,
                 };
 
@@ -244,11 +249,12 @@ impl std::fmt::Display for LiftedConstant {
 #[derive(Debug, Hash, PartialEq, Eq)]
 pub struct LifetimeVariable {
     pub arg: Arg,
-    pub created: usize,
+    pub created: Option<usize>,
+    pub deleted: Option<usize>,
     pub uses: Vec<usize>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub struct LifetimeBlock {
     pub imported: HashSet<Arg>,
     pub exported: HashSet<Arg>,
@@ -262,7 +268,7 @@ pub struct LiftedBlock {
 }
 
 impl LiftedBlock {
-    pub fn lift(p: parsed::Block<'_, '_>) -> LiftedBlock {
+    pub fn lift(p: Block<'_, '_>) -> LiftedBlock {
         let instructions = p.instructions.into_iter().map(|x| x.op_code.clone()).collect();
         let forks_to = p.forks_to.into_iter().map(|i| LiftedBlockId(i.addr)).collect();
 
@@ -276,6 +282,14 @@ impl LiftedBlock {
 
         self.instructions.extend(block.instructions);
         self.forks_to = block.forks_to;
+    }
+
+    pub fn push_front(&mut self, i: impl IntoIterator<Item = impl Into<OpCode>>) {
+        self.instructions.splice(0..0, i.into_iter().map(Into::into));
+    }
+
+    pub fn push_back(&mut self, i: impl IntoIterator<Item = impl Into<OpCode>>) {
+        self.instructions.extend(i.into_iter().map(Into::into));
     }
 }
 
@@ -309,7 +323,7 @@ impl LiftedBlock {
                         }
                     }
 
-                    let op = CustomOpCode::Closure(dest, Arg::FnConstant(cidx), upvs);
+                    let op = ExtOpCode::Closure(dest, Arg::FnConstant(cidx), upvs);
                     instructions.push(OpCode::Custom(op));
 
                     score += 1;
@@ -334,14 +348,13 @@ impl LiftedBlock {
         };
 
         // Only retain opcodes that aren't ONLY branching
-        self.instructions.retain(|op_code| {
-            !matches!(
-                op_code,
-                OpCode::Jmp(_)
-                    | OpCode::LessThan(_, _, _)
-                    | OpCode::Equals(_, _, _)
-                    | OpCode::Custom(CustomOpCode::Nop),
-            )
+        #[allow(clippy::match_like_matches_macro)]
+        self.instructions.retain(|op_code| match op_code {
+            OpCode::Jmp(_) => false,
+            OpCode::LessThan(_, _, _) => false,
+            OpCode::Equals(_, _, _) => false,
+            OpCode::Custom(ExtOpCode::Nop) => false,
+            _ => true,
         });
 
         if let Some(control_flow) = control_flow {
@@ -365,11 +378,17 @@ impl LiftedBlock {
             _ => return 0,
         };
 
-        for LifetimeVariable { arg, created, mut uses } in lifetime_data.vars {
+        for LifetimeVariable { arg, created, deleted, mut uses } in lifetime_data.vars {
+            // We're only interested in variables that were both created and discarded in this block
+            let created = match (created, deleted) {
+                (Some(created), Some(_)) => created,
+                _ => continue,
+            };
+
             uses.sort_unstable();
 
             if let [used] = *uses {
-                println!("only used once: {} ({} -> {})", arg, created, uses[0]);
+                log::debug!("only used once: {} ({} -> {})", arg, created, uses[0]);
 
                 let (solo_arg, used_arg) = match self.instructions.get(created) {
                     Some(OpCode::GetGlobal(dst, Arg::Constant(cid))) => (*dst, Arg::Global(*cid)),
@@ -398,12 +417,18 @@ impl LiftedBlock {
                     }
                 }
 
-                self.instructions[created] = OpCode::Custom(CustomOpCode::Nop);
+                self.instructions[created] = OpCode::Custom(ExtOpCode::Nop);
                 score += 1;
             }
         }
 
         score
+    }
+}
+
+impl LiftedBlock {
+    pub fn lifetime_analysis(&self) -> Option<LifetimeBlock> {
+        lifetime_analysis(&self.instructions)
     }
 }
 
@@ -413,7 +438,7 @@ fn lifetime_analysis(instructions: &[OpCode]) -> Option<LifetimeBlock> {
 
     // Vec<(Arg, from, Vec<uses>)
     let mut used_shut = vec![];
-    let mut used_open = HashMap::<Arg, (usize, Vec<usize>)>::new();
+    let mut used_open = HashMap::<Arg, (Option<usize>, Vec<usize>)>::new();
 
     for (idx, instr) in instructions.iter().enumerate() {
         // If we run into any of these instructions, surrender completely for now
@@ -425,35 +450,44 @@ fn lifetime_analysis(instructions: &[OpCode]) -> Option<LifetimeBlock> {
         }
 
         for read in instr.arguments_read() {
-            match used_open.get_mut(&read) {
-                Some((_, vec)) => vec.push(idx),
-                None => drop_copy(imported.insert(read)),
-            };
+            used_open.entry(read).or_default().1.push(idx);
         }
 
         for write in instr.arguments_write() {
             // Register a new write / create
-            let old_use = used_open.insert(write, (idx, vec![]));
+            let old_use = used_open.insert(write, (Some(idx), vec![]));
 
             // If one currently exists, close it, the current instruction overwrites the value and kills it
-            if let Some((start, end)) = old_use {
-                used_shut.push((write, start, end));
+            if let Some((start, uses)) = old_use {
+                used_shut.push((write, start, Some(idx), uses));
             };
         }
 
         if let OpCode::Return(_, _) = instr {
             for (arg, (from, uses)) in used_open.drain() {
-                used_shut.push((arg, from, uses))
+                used_shut.push((arg, from, Some(idx), uses))
             }
         }
     }
 
-    used_open.drain().for_each(|(arg, _)| drop_copy(exported.insert(arg)));
+    used_open.drain().for_each(|(arg, (start, uses))| {
+        used_shut.push((arg, start, None, uses));
+    });
 
-    let uses = used_shut
+    let vars = used_shut
         .into_iter()
-        .map(|(arg, created, uses)| LifetimeVariable { arg, created, uses })
+        .map(|(arg, created, deleted, uses)| {
+            if created.is_none() {
+                imported.insert(arg);
+            }
+
+            if deleted.is_none() {
+                exported.insert(arg);
+            }
+
+            LifetimeVariable { arg, created, deleted, uses }
+        })
         .collect();
 
-    Some(LifetimeBlock { imported, exported, vars: uses })
+    Some(LifetimeBlock { imported, exported, vars })
 }

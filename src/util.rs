@@ -8,4 +8,4 @@ impl<T: Clone> std::fmt::Debug for IgnoreDebug<T> {
     }
 }
 
-pub fn drop_copy<T: ?Sized + Copy>(_: T) {}
+pub fn discard<T>(_: T) {}
