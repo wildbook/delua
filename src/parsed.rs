@@ -6,10 +6,35 @@ use shrinkwraprs::Shrinkwrap;
 use crate::{lifted::LiftedConstant, raw, util::IgnoreDebug};
 
 pub trait OpInfo {
-    fn text(&self, constants: &[LiftedConstant]) -> String;
-    fn arguments_read(&self) -> Vec<Arg>;
-    fn arguments_write(&self) -> Vec<Arg>;
+    fn text(&self, constants: &[LiftedConstant]) -> String {
+        let text = |a: &Arg| a.text(constants);
+        self.text_with(text)
+    }
+    fn text_with(&self, arg_to_string: impl Fn(&Arg) -> String) -> String;
     fn next(&self, addr: usize) -> Vec<InstructionRef>;
+
+    // Arguments that are strictly input
+    fn args_in(&self) -> Vec<Arg>;
+
+    // Arguments that are in-place modified
+    fn args_inout(&self) -> Vec<Arg>;
+
+    // Arguments that are strictly output
+    fn args_out(&self) -> Vec<Arg>;
+
+    // Arguments that are used (in and inout, out aren't used but created)
+    fn args_used(&self) -> Vec<Arg> {
+        let mut x = self.args_in();
+        x.extend(self.args_inout());
+        x
+    }
+
+    // Arguments that are written to (inout and out)
+    fn args_written(&self) -> Vec<Arg> {
+        let mut x = self.args_inout();
+        x.extend(self.args_out());
+        x
+    }
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -32,31 +57,42 @@ impl From<ExtOpCode> for OpCode {
 }
 
 impl OpInfo for ExtOpCode {
-    fn text(&self, constants: &[LiftedConstant]) -> String {
-        let _text = |a: Arg| a.text(constants);
-
+    fn text_with(&self, text: impl Fn(&Arg) -> String) -> String {
         match self {
             ExtOpCode::Nop => String::new(),
             ExtOpCode::Comment(str) => format!("--[[ {} ]]", str),
             ExtOpCode::Closure(into, cidx, args) => {
-                format!("{} = CreateClosure({}, [{}])", into, cidx, args.iter().join(","))
+                let args = args.iter().map(|x| text(x)).join(",");
+                format!("{} = CreateClosure({}, [{}])", text(into), cidx, args)
             },
         }
     }
 
-    fn arguments_read(&self) -> Vec<Arg> {
+    fn args_in(&self) -> Vec<Arg> {
         match self {
             ExtOpCode::Nop => vec![],
             ExtOpCode::Comment(_) => vec![],
-            ExtOpCode::Closure(_, _, _) => vec![],
+            ExtOpCode::Closure(_, cidx, args) => {
+                let mut args = args.clone();
+                args.push(*cidx);
+                args
+            },
         }
     }
 
-    fn arguments_write(&self) -> Vec<Arg> {
+    fn args_inout(&self) -> Vec<Arg> {
+        match self {
+            ExtOpCode::Closure(_, _, _) => vec![],
+            ExtOpCode::Comment(_) => vec![],
+            ExtOpCode::Nop => vec![],
+        }
+    }
+
+    fn args_out(&self) -> Vec<Arg> {
         match self {
             ExtOpCode::Nop => vec![],
             ExtOpCode::Comment(_) => vec![],
-            ExtOpCode::Closure(into, _, _) => vec![*into],
+            &ExtOpCode::Closure(into, _, _) => vec![into],
         }
     }
 
@@ -68,10 +104,13 @@ impl OpInfo for ExtOpCode {
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub enum OpCode {
+    // Arg is used when the argument is directly read / written
+    // ArgSlot is used when only the argument's slot is used (for spans etc.)
+    // The latter is a lot less common, and is (so far) only used for registers
     Move(Arg, Arg),
     LoadK(Arg, Arg),
     LoadBool(Arg, Arg, Arg),
-    LoadNil(Arg, Arg),
+    LoadNil(ArgSlot, ArgSlot),
     GetUpVal(Arg, Arg),
     GetGlobal(Arg, Arg),
     GetTable(Arg, Arg, Arg),
@@ -96,33 +135,34 @@ pub enum OpCode {
     LessThanOrEquals(Arg, Arg, Arg),
     Test(Arg, Arg),
     TestSet(Arg, Arg, Arg),
-    Call(Arg, Arg, Arg),
-    TailCall(Arg, Arg),
-    Return(Arg, Arg),
-    ForLoop(Arg, Arg),
-    ForPrep(Arg, Arg),
-    TForLoop(Arg, Arg),
-    SetList(Arg, Arg, Arg),
-    Close(Arg),
+    Call(ArgSlot, Arg, Arg),
+    TailCall(ArgSlot, Arg),
+    Return(ArgSlot, Arg),
+    ForLoop(ArgSlot, Arg),
+    ForPrep(ArgSlot, Arg),
+    TForLoop(ArgSlot, Arg),
+    SetList(ArgSlot, Arg, Arg),
+    Close(ArgSlot),
     Closure(Arg, Arg),
-    Vararg(Arg, Arg),
+    Vararg(ArgSlot, Arg),
 
     Custom(ExtOpCode),
 }
 
 impl OpInfo for OpCode {
-    fn text(&self, constants: &[LiftedConstant]) -> String {
-        let text = |a: &Arg| a.text(constants);
-
+    fn text_with(&self, text: impl Fn(&Arg) -> String) -> String {
         match self {
             OpCode::Move(a, b) => format!("{} = {}", text(a), text(b)),
             OpCode::LoadK(a, b) => format!("{} = {}", text(a), text(b)),
-            OpCode::LoadBool(a, Arg::Value(b), Arg::Value(c)) => match c {
+            OpCode::LoadBool(a, Arg(_, ArgSlot::Value(b)), Arg(_, ArgSlot::Value(c))) => match c {
                 0 => format!("{} = {}", text(a), *b != 0),
                 _ => format!("{} = {} (skip)", text(a), *b != 0),
             },
-            &OpCode::LoadNil(Arg::Register(a), Arg::Register(b)) => {
-                format!("{} = nil", (a..=b).map(Arg::Register).map(|x| text(&x)).join(", "))
+            &OpCode::LoadNil(ArgSlot::Register(a), ArgSlot::Register(b)) => {
+                format!(
+                    "{} = nil",
+                    (a..=b).map(ArgSlot::Register).map(Arg::write).map(|x| text(&x)).join(", ")
+                )
             },
             OpCode::GetUpVal(a, b) => format!("{} = {}", text(a), text(b)),
             OpCode::GetGlobal(a, b) => format!("{} = _G[{}]", text(a), text(b)),
@@ -133,12 +173,12 @@ impl OpInfo for OpCode {
             OpCode::NewTable(a, b, c) => {
                 format!("{} = {{ }} --[[ arr: {}, hash: {} ]]", text(a), text(b), text(c))
             },
-            &OpCode::This(Arg::Register(a), Arg::Register(b), c) => {
+            &OpCode::This(Arg(_, ArgSlot::Register(a)), Arg(_, ArgSlot::Register(b)), c) => {
                 format!(
                     "{}, {} = {b}, {b}[{c}]",
-                    text(&Arg::Register(a + 1)),
-                    text(&Arg::Register(a)),
-                    b = text(&Arg::Register(b)),
+                    text(&Arg(ArgDir::Write, ArgSlot::Register(a + 1))),
+                    text(&Arg(ArgDir::Write, ArgSlot::Register(a))),
+                    b = text(&Arg(ArgDir::Read, ArgSlot::Register(b))),
                     c = text(&c),
                 )
             },
@@ -153,15 +193,15 @@ impl OpInfo for OpCode {
             OpCode::Len(a, b) => format!("{} = #{}", text(a), text(b)),
             OpCode::Concat(a, b, c) => format!("{} = {} .. {}", text(a), text(b), text(c)),
             OpCode::Jmp(_) => "jmp".to_string(),
-            OpCode::Equals(Arg::Value(a), b, c) => match a {
+            OpCode::Equals(Arg(_, ArgSlot::Value(a)), b, c) => match a {
                 0 => format!("{} == {}", text(b), text(c)),
                 _ => format!("{} ~= {}", text(b), text(c)),
             },
-            OpCode::LessThan(Arg::Value(a), b, c) => match a {
+            OpCode::LessThan(Arg(_, ArgSlot::Value(a)), b, c) => match a {
                 0 => format!("{} < {}", text(b), text(c)),
                 _ => format!("{} > {}", text(b), text(c)),
             },
-            OpCode::LessThanOrEquals(Arg::Value(a), b, c) => match a {
+            OpCode::LessThanOrEquals(Arg(_, ArgSlot::Value(a)), b, c) => match a {
                 0 => format!("{} <= {}", text(b), text(c)),
                 _ => format!("{} >= {}", text(b), text(c)),
             },
@@ -169,63 +209,92 @@ impl OpInfo for OpCode {
                 format!("{} test {}", text(a), text(c))
             },
             // OpCode::TestSet(_, _, _) => {}
-            &OpCode::Call(Arg::Register(a), Arg::Value(b), Arg::Value(c)) => {
+            &OpCode::Call(
+                ArgSlot::Register(a),
+                Arg(_, ArgSlot::Value(b)),
+                Arg(_, ArgSlot::Value(c)),
+            ) => {
                 let reg_ret = match c {
-                    0 => vec![Arg::Top],
+                    0 => vec![Arg(ArgDir::Write, ArgSlot::Top)],
                     1 => vec![],
-                    c => (a..=a + c - 2).map(Arg::Register).collect::<Vec<_>>(),
+                    c => (a..=a + c - 2).map(ArgSlot::Register).map(Arg::write).collect::<Vec<_>>(),
                 };
 
                 let reg_arg = match b {
-                    0 => vec![Arg::Top],
-                    _ => (a + 1..=a + b - 1).map(Arg::Register).collect::<Vec<_>>(),
+                    0 => vec![Arg(ArgDir::Read, ArgSlot::Top)],
+                    _ => (a + 1..=a + b - 1)
+                        .map(ArgSlot::Register)
+                        .map(Arg::read)
+                        .collect::<Vec<_>>(),
                 };
 
-                let reg_ret = reg_ret.into_iter().map(|x| x.to_string()).join(", ");
-                let reg_arg = reg_arg.into_iter().map(|x| x.to_string()).join(", ");
+                let reg_ret = reg_ret.iter().map(&text).join(", ");
+                let reg_arg = reg_arg.iter().map(&text).join(", ");
+
+                let a = text(&Arg::read(ArgSlot::Register(a)));
 
                 match reg_ret.len() {
-                    0 => format!("loc_{}({})", a, reg_arg),
-                    _ => format!("{} = loc_{}({})", reg_ret, a, reg_arg),
+                    0 => format!("{}({})", a, reg_arg),
+                    _ => format!("{} = {}({})", reg_ret, a, reg_arg),
                 }
             },
-            &OpCode::TailCall(Arg::Register(a), Arg::Value(b)) => {
+            &OpCode::TailCall(ArgSlot::Register(a), Arg(_, ArgSlot::Value(b))) => {
                 let reg_arg = match b {
-                    0 => vec![Arg::Top],
-                    _ => (a + 1..=a + b - 1).map(Arg::Register).collect::<Vec<_>>(),
+                    0 => vec![Arg::write(ArgSlot::Top)],
+                    _ => (a + 1..=a + b - 1)
+                        .map(ArgSlot::Register)
+                        .map(Arg::write)
+                        .collect::<Vec<_>>(),
                 };
 
-                let reg_arg = reg_arg.into_iter().map(|x| x.to_string()).join(", ");
-                format!("{} = loc_{}({})", Arg::Top, a, reg_arg)
-            },
-            &OpCode::Return(Arg::Register(a), Arg::Value(b)) => match b {
-                0 => format!("return {}", Arg::Top),
-                1 => "return".to_string(),
-                _ => {
-                    let ret = (a..=a + b - 2).map(Arg::Register).map(|x| x.to_string()).join(", ");
-                    format!("return {}", ret)
-                },
-            },
-            &OpCode::ForLoop(Arg::Register(a), _) => {
+                let reg_arg = reg_arg.iter().map(&text).join(", ");
                 format!(
-                    "for i = {},{},{} do",
-                    text(&Arg::Register(a)),
-                    text(&Arg::Register(a + 1)),
-                    text(&Arg::Register(a + 2)),
+                    "{} = {}({})",
+                    ArgSlot::Top,
+                    text(&Arg::read(ArgSlot::Register(a))),
+                    reg_arg
                 )
             },
-            // OpCode::ForPrep(_, _) => {}
+            &OpCode::Return(ArgSlot::Register(a), Arg(_, ArgSlot::Value(b))) => match b {
+                0 => format!("return {}", ArgSlot::Top),
+                1 => "return".to_string(),
+                _ => {
+                    format!(
+                        "return {}",
+                        (a..=a + b - 2)
+                            .map(ArgSlot::Register)
+                            .map(Arg::read)
+                            .map(|x| text(&x))
+                            .join(", ")
+                    )
+                },
+            },
+            &OpCode::ForLoop(ArgSlot::Register(a), _) => {
+                format!(
+                    "for {} = {},{},{} do",
+                    text(&Arg::write(ArgSlot::Register(a + 3))),
+                    text(&Arg::modify(ArgSlot::Register(a))),
+                    text(&Arg::read(ArgSlot::Register(a + 1))),
+                    text(&Arg::read(ArgSlot::Register(a + 2))),
+                )
+            },
+            &OpCode::ForPrep(ArgSlot::Register(a), _) => {
+                format!(
+                    "{} -= {}",
+                    text(&Arg::modify(ArgSlot::Register(a))),
+                    text(&Arg::read(ArgSlot::Register(a + 2)))
+                )
+            },
             // OpCode::TForLoop(_, _) => {}
             // OpCode::SetList(Arg::Register(a), Arg::Value(b), _) => { },
             // OpCode::Close(_) => {}
             OpCode::Closure(a, b) => format!("{} = {}", text(a), text(b)),
-            &OpCode::Vararg(Arg::Register(a), Arg::Value(b)) => {
-                let args = (a..=a + b - 1).map(Arg::Register).collect::<Vec<_>>();
+            &OpCode::Vararg(ArgSlot::Register(a), Arg(_, ArgSlot::Value(b))) => {
+                let args = (a..=a + b - 1).map(ArgSlot::Register).collect::<Vec<_>>();
                 format!("{:?} = ...", args)
             },
-            OpCode::Custom(custom) => custom.text(constants),
+            OpCode::Custom(custom) => custom.text_with(text),
             _ => format!(" -- {:?}", self),
-            // _ => format!("--"),
         }
     }
 
@@ -233,15 +302,23 @@ impl OpInfo for OpCode {
         let skip = |off: i32| InstructionRef::Instruction((addr as i32 + off + 1) as usize);
 
         match self {
-            &OpCode::LoadBool(_, _, Arg::Value(c)) => match c {
+            &OpCode::LoadBool(_, _, Arg(_, ArgSlot::Value(c))) => match c {
                 0 => vec![skip(0)],
                 _ => vec![skip(1)],
             },
-            &OpCode::Jmp(Arg::SignedValue(a)) => vec![skip(a as _)],
-            OpCode::Equals(Arg::Value(0), Arg::Constant(b), Arg::Constant(c)) if b == c => {
+            &OpCode::Jmp(Arg(_, ArgSlot::SignedValue(a))) => vec![skip(a as _)],
+            OpCode::Equals(
+                Arg(_, ArgSlot::Value(0)),
+                Arg(_, ArgSlot::Constant(b)),
+                Arg(_, ArgSlot::Constant(c)),
+            ) if b == c => {
                 vec![skip(0)]
             },
-            OpCode::Equals(Arg::Value(_), Arg::Constant(b), Arg::Constant(c)) if b == c => {
+            OpCode::Equals(
+                Arg(_, ArgSlot::Value(_)),
+                Arg(_, ArgSlot::Constant(b)),
+                Arg(_, ArgSlot::Constant(c)),
+            ) if b == c => {
                 vec![skip(1)]
             },
             OpCode::Equals(_, _, _) => vec![skip(0), skip(1)],
@@ -249,8 +326,8 @@ impl OpInfo for OpCode {
             OpCode::LessThanOrEquals(_, _, _) => vec![skip(0), skip(1)],
             OpCode::Test(_, _) => vec![skip(0), skip(1)],
             OpCode::TestSet(_, _, _) => vec![skip(0), skip(1)],
-            &OpCode::ForLoop(_, Arg::SignedValue(sbx)) => vec![skip(0), skip(sbx as _)],
-            &OpCode::ForPrep(_, Arg::SignedValue(sbx)) => vec![skip(sbx as _)],
+            &OpCode::ForLoop(_, Arg(_, ArgSlot::SignedValue(sbx))) => vec![skip(0), skip(sbx as _)],
+            &OpCode::ForPrep(_, Arg(_, ArgSlot::SignedValue(sbx))) => vec![skip(sbx as _)],
             OpCode::TForLoop(_, _) => vec![skip(0), skip(1)],
             OpCode::Return(_, _) => vec![InstructionRef::FunctionExit],
             _ => vec![skip(0)],
@@ -258,18 +335,20 @@ impl OpInfo for OpCode {
     }
 
     // All arguments that this instruction might read
-    fn arguments_read(&self) -> Vec<Arg> {
+    fn args_in(&self) -> Vec<Arg> {
         match self {
             &OpCode::Move(_, b) => vec![b],
             &OpCode::LoadK(_, b) => vec![b],
             &OpCode::LoadBool(_, b, c) => vec![b, c],
-            &OpCode::LoadNil(_, b) => vec![b],
+            &OpCode::LoadNil(_, _) => vec![],
             &OpCode::GetUpVal(_, b) => vec![b],
-            &OpCode::GetGlobal(_, Arg::Constant(b)) => vec![Arg::Global(b)],
+            &OpCode::GetGlobal(_, Arg(_, ArgSlot::Constant(b))) => {
+                vec![Arg::read(ArgSlot::Global(b))]
+            },
             &OpCode::GetTable(_, b, c) => vec![b, c],
             &OpCode::SetGlobal(a, _) => vec![a],
             &OpCode::SetUpVal(a, _) => vec![a],
-            &OpCode::SetTable(_, b, c) => vec![b, c],
+            &OpCode::SetTable(a, b, c) => vec![a, b, c],
             &OpCode::NewTable(_, b, c) => vec![b, c],
             &OpCode::This(_, b, c) => vec![b, c],
             &OpCode::Add(_, b, c) => vec![b, c],
@@ -288,51 +367,59 @@ impl OpInfo for OpCode {
             &OpCode::LessThanOrEquals(a, b, c) => vec![a, b, c],
             &OpCode::Test(a, b) => vec![a, b],
             &OpCode::TestSet(a, b, c) => vec![a, b, c],
-            &OpCode::Call(Arg::Register(a), Arg::Value(b), _) => match b {
-                0 => vec![Arg::Top],
+            &OpCode::Call(ArgSlot::Register(a), Arg(_, ArgSlot::Value(b)), _) => match b {
+                0 => vec![Arg::read(ArgSlot::Top)],
                 1 => vec![],
-                b => (a..=a + b - 1).map(Arg::Register).collect(),
+                b => (a..=a + b - 1).map(ArgSlot::Register).map(Arg::read).collect(),
             },
-            &OpCode::TailCall(Arg::Register(a), Arg::Value(b)) => {
-                (a..=a + b - 1).map(Arg::Register).collect()
+            &OpCode::TailCall(ArgSlot::Register(a), Arg(_, ArgSlot::Value(b))) => {
+                (a..=a + b - 1).map(ArgSlot::Register).map(Arg::read).collect()
             },
-            &OpCode::Return(Arg::Register(a), Arg::Value(b)) => match b < 2 {
+            &OpCode::Return(ArgSlot::Register(a), Arg(_, ArgSlot::Value(b))) => match b < 2 {
                 true => vec![],
-                false => (a..=a + b - 2).map(Arg::Register).collect::<Vec<_>>(),
+                false => (a..=a + b - 2).map(ArgSlot::Register).map(Arg::read).collect::<Vec<_>>(),
             },
-            &OpCode::ForLoop(Arg::Register(a), _) => (a..=a + 2).map(Arg::Register).collect(),
-            &OpCode::ForPrep(Arg::Register(a), Arg::SignedValue(b)) => {
-                vec![Arg::Register(a + 2), Arg::SignedValue(b)]
+            &OpCode::ForLoop(ArgSlot::Register(a), _) => {
+                (a..=a + 2).map(ArgSlot::Register).map(Arg::read).collect()
             },
-            &OpCode::TForLoop(Arg::Register(a), _) => (a..=a + 3).map(Arg::Register).collect(),
-            &OpCode::SetList(Arg::Register(a), Arg::Value(b), _) => {
-                (a..=a + b).map(Arg::Register).collect()
+            &OpCode::ForPrep(ArgSlot::Register(a), b) => {
+                vec![Arg::read(ArgSlot::Register(a + 2)), b]
+            },
+            &OpCode::TForLoop(ArgSlot::Register(a), _) => {
+                (a..=a + 3).map(ArgSlot::Register).map(Arg::read).collect()
+            },
+            &OpCode::SetList(ArgSlot::Register(a), Arg(_, ArgSlot::Value(b)), _) => {
+                (a..=a + b).map(ArgSlot::Register).map(Arg::read).collect()
             },
             &OpCode::Vararg(_, _) => vec![],
             opc @ OpCode::Close(_) => panic!("OpCode::Close unsupported: {:?}", opc),
             opc @ OpCode::Closure(_, _) => panic!("OpCode::Closure unsupported: {:?}", opc),
-            OpCode::Custom(c) => c.arguments_read(),
+            OpCode::Custom(c) => c.args_in(),
             opc => panic!("undefined opcode: {:?}", opc),
         }
     }
 
     // All arguments that this instruction might write
-    fn arguments_write(&self) -> Vec<Arg> {
+    fn args_out(&self) -> Vec<Arg> {
         match self {
             &OpCode::Move(a, _) => vec![a],
             &OpCode::LoadK(a, _) => vec![a],
             &OpCode::LoadBool(a, _, _) => vec![a],
-            &OpCode::LoadNil(Arg::Register(a), Arg::Register(b)) => {
-                (a..=b).map(Arg::Register).collect()
+            &OpCode::LoadNil(ArgSlot::Register(a), ArgSlot::Register(b)) => {
+                (a..=b).map(ArgSlot::Register).map(Arg::write).collect()
             },
             &OpCode::GetUpVal(a, _) => vec![a],
             &OpCode::GetGlobal(a, _) => vec![a],
             &OpCode::GetTable(a, _, _) => vec![a],
-            &OpCode::SetGlobal(_, Arg::Constant(b)) => vec![Arg::Global(b)],
+            &OpCode::SetGlobal(_, Arg(_, ArgSlot::Constant(b))) => {
+                vec![Arg::write(ArgSlot::Global(b))]
+            },
             &OpCode::SetUpVal(_, b) => vec![b],
-            &OpCode::SetTable(a, _, _) => vec![a],
+            &OpCode::SetTable(_, _, _) => vec![],
             &OpCode::NewTable(a, _, _) => vec![a],
-            &OpCode::This(Arg::Register(a), _, _) => vec![Arg::Register(a), Arg::Register(a + 1)],
+            &OpCode::This(Arg(_, ArgSlot::Register(a)), _, _) => {
+                vec![Arg::write(ArgSlot::Register(a)), Arg::write(ArgSlot::Register(a + 1))]
+            },
             &OpCode::Add(a, _, _) => vec![a],
             &OpCode::Sub(a, _, _) => vec![a],
             &OpCode::Mul(a, _, _) => vec![a],
@@ -349,26 +436,36 @@ impl OpInfo for OpCode {
             &OpCode::LessThanOrEquals(_, _, _) => vec![],
             &OpCode::Test(_, _) => vec![],
             &OpCode::TestSet(_, _, _) => vec![],
-            &OpCode::Call(Arg::Register(a), _, Arg::Value(c)) => match c {
-                0 => vec![Arg::Top],
+            &OpCode::Call(ArgSlot::Register(a), _, Arg(_, ArgSlot::Value(c))) => match c {
+                0 => vec![Arg::write(ArgSlot::Top)],
                 1 => vec![],
-                c => (a..=a + c - 2).map(Arg::Register).collect(),
+                c => (a..=a + c - 2).map(ArgSlot::Register).map(Arg::write).collect(),
             },
             &OpCode::TailCall(_, _) => vec![],
             &OpCode::Return(_, _) => vec![],
-            &OpCode::ForLoop(Arg::Register(a), _) => vec![Arg::Register(a), Arg::Register(a + 3)],
-            &OpCode::ForPrep(a, _) => vec![a],
-            &OpCode::TForLoop(Arg::Register(a), Arg::Value(c)) => {
-                (a + 3..=a + 2 + c).map(Arg::Register).collect()
+            &OpCode::ForLoop(ArgSlot::Register(a), _) => {
+                vec![Arg::write(ArgSlot::Register(a + 3))]
+            },
+            &OpCode::ForPrep(_, _) => vec![],
+            &OpCode::TForLoop(ArgSlot::Register(a), Arg(_, ArgSlot::Value(c))) => {
+                (a + 3..=a + 2 + c).map(ArgSlot::Register).map(Arg::write).collect()
             },
             &OpCode::SetList(_, _, _) => vec![],
-            &OpCode::Vararg(Arg::Register(a), Arg::Value(b)) => {
-                (a..a + b - 1).map(Arg::Register).collect()
+            &OpCode::Vararg(ArgSlot::Register(a), Arg(_, ArgSlot::Value(b))) => {
+                (a..a + b - 1).map(ArgSlot::Register).map(Arg::write).collect()
             },
             &OpCode::Closure(a, _) => vec![a],
-            OpCode::Custom(c) => c.arguments_write(),
+            OpCode::Custom(c) => c.args_out(),
             opc @ OpCode::Close(_) => panic!("OpCode::Close unsupported: {:?}", opc),
             opc => panic!("undefined opcode: {:?}", opc),
+        }
+    }
+
+    fn args_inout(&self) -> Vec<Arg> {
+        match *self {
+            OpCode::ForLoop(a, _) => vec![Arg::modify(a)],
+            OpCode::ForPrep(a, _) => vec![Arg::modify(a)],
+            _ => vec![],
         }
     }
 }
@@ -389,7 +486,14 @@ impl std::fmt::Display for ConstantId {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum Arg {
+pub enum ArgDir {
+    Read,
+    Modify,
+    Write,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ArgSlot {
     Top,
     Register(u32),
     UpValue(u32),
@@ -400,18 +504,49 @@ pub enum Arg {
     Global(ConstantId),
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Shrinkwrap)]
+pub struct Arg(pub ArgDir, #[shrinkwrap(main_field)] pub ArgSlot);
+
+impl std::fmt::Display for Arg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.1.fmt(f)
+    }
+}
+
 impl Arg {
+    pub fn read(slot: ArgSlot) -> Arg {
+        Arg(ArgDir::Read, slot)
+    }
+
+    pub fn modify(slot: ArgSlot) -> Arg {
+        Arg(ArgDir::Modify, slot)
+    }
+
+    pub fn write(slot: ArgSlot) -> Arg {
+        Arg(ArgDir::Write, slot)
+    }
+
+    pub fn slot(self) -> ArgSlot {
+        self.1
+    }
+
+    pub fn dir(self) -> ArgDir {
+        self.0
+    }
+}
+
+impl ArgSlot {
     pub fn is_reg(&self) -> bool {
-        matches!(self, Arg::Register(_))
+        matches!(self, ArgSlot::Register(_))
     }
 
     pub fn text(&self, consts: &[LiftedConstant]) -> String {
         match self {
-            Arg::Constant(x) => match consts.get(x.0 as usize) {
+            ArgSlot::Constant(x) => match consts.get(x.0 as usize) {
                 Some(c) => format!("{}", c),
                 None => format!("{}", x),
             },
-            Arg::Global(x) => match consts.get(x.0 as usize) {
+            ArgSlot::Global(x) => match consts.get(x.0 as usize) {
                 Some(c) => format!("_G[{}]", c),
                 None => format!("_G[{}]", x),
             },
@@ -420,30 +555,30 @@ impl Arg {
     }
 }
 
-impl<'a> std::fmt::Display for Arg {
+impl<'a> std::fmt::Display for ArgSlot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Arg::Value(x) => write!(f, "{}", x),
-            Arg::SignedValue(x) => write!(f, "{}", x),
-            Arg::Constant(x) => write!(f, "{}", x),
-            Arg::FnConstant(x) => write!(f, "FnConstant({})", x),
-            Arg::Register(x) => write!(f, "loc_{}", x),
-            Arg::Global(x) => write!(f, "Global[{}]", x),
-            Arg::UpValue(x) => write!(f, "UpValue[{}]", x),
-            Arg::Top => write!(f, "Arg::Top"),
+            ArgSlot::Value(x) => write!(f, "{}", x),
+            ArgSlot::SignedValue(x) => write!(f, "{}", x),
+            ArgSlot::Constant(x) => write!(f, "{}", x),
+            ArgSlot::FnConstant(x) => write!(f, "FnConstant({})", x),
+            ArgSlot::Register(x) => write!(f, "loc_{}", x),
+            ArgSlot::Global(x) => write!(f, "Global[{}]", x),
+            ArgSlot::UpValue(x) => write!(f, "UpValue[{}]", x),
+            ArgSlot::Top => write!(f, "Arg::Top"),
         }
     }
 }
 
-impl<'a> Arg {
-    pub fn constant(index: u32) -> Arg {
-        Arg::Constant(ConstantId(index))
+impl<'a> ArgSlot {
+    pub fn constant(index: u32) -> ArgSlot {
+        ArgSlot::Constant(ConstantId(index))
     }
 
-    pub fn const_or_reg(index: u32) -> Arg {
+    pub fn const_or_reg(index: u32) -> ArgSlot {
         match index & (1 << 8) {
-            0 => Arg::Register(index & 0xFF),
-            _ => Arg::constant(index & 0xFF),
+            0 => ArgSlot::Register(index & 0xFF),
+            _ => ArgSlot::constant(index & 0xFF),
         }
     }
 }
@@ -486,90 +621,152 @@ pub struct Instruction<'a> {
 impl<'a> Instruction<'a> {
     pub fn parse(f: &'a raw::LuaFunction, i: &'a raw::LuaInstruction, addr: usize) -> Self {
         let op_code = match i.op() {
-            0 => OpCode::Move(Arg::Register(i.a()), Arg::Register(i.b())),
-            1 => OpCode::LoadK(Arg::Register(i.a()), Arg::constant(i.bx())),
-            2 => OpCode::LoadBool(Arg::Register(i.a()), Arg::Value(i.b()), Arg::Value(i.c())),
-            3 => OpCode::LoadNil(Arg::Register(i.a()), Arg::Register(i.b())),
-            4 => OpCode::GetUpVal(Arg::Register(i.a()), Arg::UpValue(i.b())),
-            5 => OpCode::GetGlobal(Arg::Register(i.a()), Arg::constant(i.bx())),
+            0 => OpCode::Move(
+                Arg::write(ArgSlot::Register(i.a())),
+                Arg::read(ArgSlot::Register(i.b())),
+            ),
+            1 => OpCode::LoadK(
+                Arg::write(ArgSlot::Register(i.a())),
+                Arg::read(ArgSlot::constant(i.bx())),
+            ),
+            2 => OpCode::LoadBool(
+                Arg::write(ArgSlot::Register(i.a())),
+                Arg::read(ArgSlot::Value(i.b())),
+                Arg::read(ArgSlot::Value(i.c())),
+            ),
+            3 => OpCode::LoadNil(ArgSlot::Register(i.a()), ArgSlot::Register(i.b())),
+            4 => OpCode::GetUpVal(
+                Arg::write(ArgSlot::Register(i.a())),
+                Arg::read(ArgSlot::UpValue(i.b())),
+            ),
+            5 => OpCode::GetGlobal(
+                Arg::write(ArgSlot::Register(i.a())),
+                Arg::read(ArgSlot::constant(i.bx())),
+            ),
             6 => OpCode::GetTable(
-                Arg::Register(i.a()),
-                Arg::Register(i.b()),
-                Arg::const_or_reg(i.c()),
+                Arg::write(ArgSlot::Register(i.a())),
+                Arg::read(ArgSlot::Register(i.b())),
+                Arg::read(ArgSlot::const_or_reg(i.c())),
             ),
-            7 => OpCode::SetGlobal(Arg::Register(i.a()), Arg::constant(i.bx())),
-            8 => OpCode::SetUpVal(Arg::Register(i.a()), Arg::UpValue(i.b())),
+            7 => OpCode::SetGlobal(
+                Arg::read(ArgSlot::Register(i.a())),
+                Arg::write(ArgSlot::constant(i.bx())),
+            ),
+            8 => OpCode::SetUpVal(
+                Arg::read(ArgSlot::Register(i.a())),
+                Arg::write(ArgSlot::UpValue(i.b())),
+            ),
             9 => OpCode::SetTable(
-                Arg::Register(i.a()),
-                Arg::const_or_reg(i.b()),
-                Arg::const_or_reg(i.c()),
+                Arg::read(ArgSlot::Register(i.a())),
+                Arg::read(ArgSlot::const_or_reg(i.b())),
+                Arg::read(ArgSlot::const_or_reg(i.c())),
             ),
-            10 => OpCode::NewTable(Arg::Register(i.a()), Arg::Value(i.b()), Arg::Value(i.c())),
-            11 => {
-                OpCode::This(Arg::Register(i.a()), Arg::Register(i.b()), Arg::const_or_reg(i.c()))
-            },
+            10 => OpCode::NewTable(
+                Arg::write(ArgSlot::Register(i.a())),
+                Arg::read(ArgSlot::Value(i.b())),
+                Arg::read(ArgSlot::Value(i.c())),
+            ),
+            11 => OpCode::This(
+                Arg::write(ArgSlot::Register(i.a())),
+                Arg::read(ArgSlot::Register(i.b())),
+                Arg::read(ArgSlot::const_or_reg(i.c())),
+            ),
             12 => OpCode::Add(
-                Arg::Register(i.a()),
-                Arg::const_or_reg(i.b()),
-                Arg::const_or_reg(i.c()),
+                Arg::write(ArgSlot::Register(i.a())),
+                Arg::read(ArgSlot::const_or_reg(i.b())),
+                Arg::read(ArgSlot::const_or_reg(i.c())),
             ),
             13 => OpCode::Sub(
-                Arg::Register(i.a()),
-                Arg::const_or_reg(i.b()),
-                Arg::const_or_reg(i.c()),
+                Arg::write(ArgSlot::Register(i.a())),
+                Arg::read(ArgSlot::const_or_reg(i.b())),
+                Arg::read(ArgSlot::const_or_reg(i.c())),
             ),
             14 => OpCode::Mul(
-                Arg::Register(i.a()),
-                Arg::const_or_reg(i.b()),
-                Arg::const_or_reg(i.c()),
+                Arg::write(ArgSlot::Register(i.a())),
+                Arg::read(ArgSlot::const_or_reg(i.b())),
+                Arg::read(ArgSlot::const_or_reg(i.c())),
             ),
             15 => OpCode::Div(
-                Arg::Register(i.a()),
-                Arg::const_or_reg(i.b()),
-                Arg::const_or_reg(i.c()),
+                Arg::write(ArgSlot::Register(i.a())),
+                Arg::read(ArgSlot::const_or_reg(i.b())),
+                Arg::read(ArgSlot::const_or_reg(i.c())),
             ),
             16 => OpCode::Mod(
-                Arg::Register(i.a()),
-                Arg::const_or_reg(i.b()),
-                Arg::const_or_reg(i.c()),
+                Arg::write(ArgSlot::Register(i.a())),
+                Arg::read(ArgSlot::const_or_reg(i.b())),
+                Arg::read(ArgSlot::const_or_reg(i.c())),
             ),
             17 => OpCode::Pow(
-                Arg::Register(i.a()),
-                Arg::const_or_reg(i.b()),
-                Arg::const_or_reg(i.c()),
+                Arg::write(ArgSlot::Register(i.a())),
+                Arg::read(ArgSlot::const_or_reg(i.b())),
+                Arg::read(ArgSlot::const_or_reg(i.c())),
             ),
-            18 => OpCode::Unm(Arg::Register(i.a()), Arg::Register(i.b())),
-            19 => OpCode::Not(Arg::Register(i.a()), Arg::Register(i.b())),
-            20 => OpCode::Len(Arg::Register(i.a()), Arg::Register(i.b())),
-            21 => OpCode::Concat(Arg::Register(i.a()), Arg::Register(i.b()), Arg::Register(i.c())),
-            22 => OpCode::Jmp(Arg::SignedValue(i.bx_s())),
+            18 => OpCode::Unm(
+                Arg::write(ArgSlot::Register(i.a())),
+                Arg::read(ArgSlot::Register(i.b())),
+            ),
+            19 => OpCode::Not(
+                Arg::write(ArgSlot::Register(i.a())),
+                Arg::read(ArgSlot::Register(i.b())),
+            ),
+            20 => OpCode::Len(
+                Arg::write(ArgSlot::Register(i.a())),
+                Arg::read(ArgSlot::Register(i.b())),
+            ),
+            21 => OpCode::Concat(
+                Arg::write(ArgSlot::Register(i.a())),
+                Arg::read(ArgSlot::Register(i.b())),
+                Arg::read(ArgSlot::Register(i.c())),
+            ),
+            22 => OpCode::Jmp(Arg::read(ArgSlot::SignedValue(i.bx_s()))),
             23 => OpCode::Equals(
-                Arg::Value(i.a()),
-                Arg::const_or_reg(i.b()),
-                Arg::const_or_reg(i.c()),
+                Arg::read(ArgSlot::Value(i.a())),
+                Arg::read(ArgSlot::const_or_reg(i.b())),
+                Arg::read(ArgSlot::const_or_reg(i.c())),
             ),
             24 => OpCode::LessThan(
-                Arg::Value(i.a()),
-                Arg::const_or_reg(i.b()),
-                Arg::const_or_reg(i.c()),
+                Arg::read(ArgSlot::Value(i.a())),
+                Arg::read(ArgSlot::const_or_reg(i.b())),
+                Arg::read(ArgSlot::const_or_reg(i.c())),
             ),
             25 => OpCode::LessThanOrEquals(
-                Arg::Value(i.a()),
-                Arg::const_or_reg(i.b()),
-                Arg::const_or_reg(i.c()),
+                Arg::read(ArgSlot::Value(i.a())),
+                Arg::read(ArgSlot::const_or_reg(i.b())),
+                Arg::read(ArgSlot::const_or_reg(i.c())),
             ),
-            26 => OpCode::Test(Arg::Register(i.a()), Arg::Value(i.c())),
-            27 => OpCode::TestSet(Arg::Register(i.a()), Arg::Register(i.b()), Arg::Value(i.c())),
-            28 => OpCode::Call(Arg::Register(i.a()), Arg::Value(i.b()), Arg::Value(i.c())),
-            29 => OpCode::TailCall(Arg::Register(i.a()), Arg::Value(i.b())),
-            30 => OpCode::Return(Arg::Register(i.a()), Arg::Value(i.b())),
-            31 => OpCode::ForLoop(Arg::Register(i.a()), Arg::SignedValue(i.bx_s())),
-            32 => OpCode::ForPrep(Arg::Register(i.a()), Arg::SignedValue(i.bx_s())),
-            33 => OpCode::TForLoop(Arg::Register(i.a()), Arg::Value(i.c())),
-            34 => OpCode::SetList(Arg::Register(i.a()), Arg::Value(i.b()), Arg::Value(i.c())),
-            35 => OpCode::Close(Arg::Register(i.a())),
-            36 => OpCode::Closure(Arg::Register(i.a()), Arg::FnConstant(i.bx())),
-            37 => OpCode::Vararg(Arg::Register(i.a()), Arg::Value(i.b())),
+            26 => {
+                OpCode::Test(Arg::read(ArgSlot::Register(i.a())), Arg::read(ArgSlot::Value(i.c())))
+            },
+            27 => OpCode::TestSet(
+                Arg::read(ArgSlot::Register(i.a())),
+                Arg::read(ArgSlot::Register(i.b())),
+                Arg::read(ArgSlot::Value(i.c())),
+            ),
+            28 => OpCode::Call(
+                ArgSlot::Register(i.a()),
+                Arg::read(ArgSlot::Value(i.b())),
+                Arg::read(ArgSlot::Value(i.c())),
+            ),
+            29 => OpCode::TailCall(ArgSlot::Register(i.a()), Arg::read(ArgSlot::Value(i.b()))),
+            30 => OpCode::Return(ArgSlot::Register(i.a()), Arg::read(ArgSlot::Value(i.b()))),
+            31 => {
+                OpCode::ForLoop(ArgSlot::Register(i.a()), Arg::read(ArgSlot::SignedValue(i.bx_s())))
+            },
+            32 => {
+                OpCode::ForPrep(ArgSlot::Register(i.a()), Arg::read(ArgSlot::SignedValue(i.bx_s())))
+            },
+            33 => OpCode::TForLoop(ArgSlot::Register(i.a()), Arg::read(ArgSlot::Value(i.c()))),
+            34 => OpCode::SetList(
+                ArgSlot::Register(i.a()),
+                Arg::read(ArgSlot::Value(i.b())),
+                Arg::read(ArgSlot::Value(i.c())),
+            ),
+            35 => OpCode::Close(ArgSlot::Register(i.a())),
+            36 => OpCode::Closure(
+                Arg::write(ArgSlot::Register(i.a())),
+                Arg::read(ArgSlot::FnConstant(i.bx())),
+            ),
+            37 => OpCode::Vararg(ArgSlot::Register(i.a()), Arg::read(ArgSlot::Value(i.b()))),
             opc => panic!("undefined opcode: {:?}", opc),
         };
 
@@ -610,9 +807,9 @@ impl<'a> Function<'a> {
 
         let mut jumps: HashMap<InstructionRef, Vec<InstructionRef>> = HashMap::default();
 
-        log::debug!("|instructions");
+        log::trace!("|instructions");
         for i in instructions.iter() {
-            log::debug!("{:#}", i);
+            log::trace!("{:#}", i);
 
             for &target in i.dst.iter() {
                 jumps.entry(target).or_default().push(i.addr);
