@@ -8,14 +8,11 @@ use std::{
 
 use itertools::Itertools;
 
-use crate::{
-    lifted::LiftedFunction,
-    parsed::{Arg, ArgDir, ArgSlot, OpInfo},
-};
+use crate::stage_2::{Arg, ArgDir, ArgSlot, OpInfo};
 
-mod lifted;
-mod parsed;
-mod raw;
+pub mod stage_1;
+pub mod stage_2;
+pub mod stage_3;
 mod util;
 
 fn escape(s: String) -> String {
@@ -30,7 +27,7 @@ fn escape(s: String) -> String {
         .replace(r"\\l", r"\l")
 }
 
-fn output_parsed_trace(top: parsed::Function) {
+fn output_stage_1(top: stage_2::Function) {
     let mut stack = vec![top.clone()];
     while let Some(func) = stack.pop() {
         let block = func.blocks();
@@ -44,7 +41,9 @@ fn output_parsed_trace(top: parsed::Function) {
     }
 }
 
-fn output_parsed(top: parsed::Function) -> Result<std::process::Child, Box<dyn std::error::Error>> {
+fn output_stage_2(
+    top: stage_2::Function,
+) -> Result<std::process::Child, Box<dyn std::error::Error>> {
     let mut out = BufWriter::new(std::fs::File::create("output.dot")?);
     writeln!(out, "digraph L {{")?;
 
@@ -94,8 +93,10 @@ fn output_parsed(top: parsed::Function) -> Result<std::process::Child, Box<dyn s
     Ok(std::process::Command::new("dot").arg("output.dot").arg("-O").arg("-Tsvg").spawn()?)
 }
 
-fn output_lifted(top: parsed::Function) -> Result<std::process::Child, Box<dyn std::error::Error>> {
-    let mut lifted = LiftedFunction::lift(top.clone()).with_name("Entrypoint");
+fn output_stage_3(
+    top: stage_2::Function,
+) -> Result<std::process::Child, Box<dyn std::error::Error>> {
+    let mut lifted = stage_3::Function::lift(top.clone()).with_name("Entrypoint");
     dbg!(lifted.optimize_until_complete());
 
     let mut out = BufWriter::new(std::fs::File::create("output_lifted.dot")?);
@@ -179,10 +180,10 @@ fn output_lifted(top: parsed::Function) -> Result<std::process::Child, Box<dyn s
     Ok(std::process::Command::new("dot").arg("output_lifted.dot").arg("-O").arg("-Tsvg").spawn()?)
 }
 
-fn output_lifted_vars(
-    top: parsed::Function,
+fn output_stage_3_vars(
+    top: stage_2::Function,
 ) -> Result<std::process::Child, Box<dyn std::error::Error>> {
-    let mut lifted = LiftedFunction::lift(top.clone()).with_name("Entrypoint");
+    let mut lifted = stage_3::Function::lift(top.clone()).with_name("Entrypoint");
     dbg!(lifted.optimize_until_complete());
 
     let mut out = BufWriter::new(std::fs::File::create("output_lifted_vars.dot")?);
@@ -343,22 +344,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut cursor = Cursor::new(buffer);
 
     log::info!("reading LuaFile");
-    let chunk = raw::LuaFile::read(&mut cursor)?;
+    let chunk = stage_1::LuaFile::read(&mut cursor)?;
 
     log::info!("parsing top level function");
-    let top = parsed::Function::parse(&chunk.top_level_func);
+    let top = stage_2::Function::parse(&chunk.top_level_func);
 
-    log::info!("executing output_parsed_debug");
-    output_parsed_trace(top.clone());
+    log::info!("executing output_stage_1");
+    output_stage_1(top.clone());
 
-    log::info!("executing output_parsed");
-    let gv1 = output_parsed(top.clone())?;
+    log::info!("executing output_stage_2");
+    let gv1 = output_stage_2(top.clone())?;
 
-    log::info!("executing output_lifted");
-    let gv2 = output_lifted(top.clone())?;
+    log::info!("executing output_stage_3");
+    let gv2 = output_stage_3(top.clone())?;
 
-    log::info!("executing output_lifted_ssa");
-    let gv3 = output_lifted_vars(top.clone())?;
+    log::info!("executing output_stage_3_vars");
+    let gv3 = output_stage_3_vars(top.clone())?;
 
     log::info!("finished - waiting for graphviz/dot");
     for mut proc in IntoIterator::into_iter([gv1, gv2, gv3]) {

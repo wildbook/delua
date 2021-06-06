@@ -2,53 +2,49 @@ use shrinkwraprs::Shrinkwrap;
 use std::collections::{btree_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::{
-    parsed::{Arg, ArgDir, ArgSlot, Block, ExtOpCode, Function, InstructionRef, OpCode, OpInfo},
-    raw,
+    stage_1,
+    stage_2::{self, OpInfo},
     util::discard,
 };
 
 #[derive(Shrinkwrap, Debug, Eq, PartialEq, Clone, Copy, PartialOrd, Ord, Hash)]
-pub struct LiftedBlockId(pub InstructionRef);
+pub struct BlockId(pub stage_2::InstructionRef);
 
 #[derive(Debug)]
-pub struct LiftedFunction {
+pub struct Function {
     pub name: Option<String>,
-    pub blocks: BTreeMap<LiftedBlockId, LiftedBlock>,
-    pub children: Vec<LiftedFunction>,
-    pub constants: Vec<LiftedConstant>,
+    pub blocks: BTreeMap<BlockId, Block>,
+    pub children: Vec<Function>,
+    pub constants: Vec<Constant>,
     pub count_upvals: u8,
     pub count_args: u8,
-    pub used_slots: HashSet<ArgSlot>,
+    pub used_slots: HashSet<stage_2::ArgSlot>,
 }
 
 #[derive(Shrinkwrap, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct LiftedVariableId(usize);
+pub struct VariableId(usize);
 
-impl std::fmt::Display for LiftedVariableId {
+impl std::fmt::Display for VariableId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(f)
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct LiftedVariable {
-    pub id: LiftedVariableId,
-    pub origin: (LiftedBlockId, usize),
+pub struct Variable {
+    pub id: VariableId,
+    pub origin: (BlockId, usize),
 
-    pub replaces: BTreeSet<LiftedVariableId>,
-    pub uses: HashSet<(LiftedBlockId, usize)>,
-    pub mods: HashSet<(LiftedBlockId, usize)>,
+    pub replaces: BTreeSet<VariableId>,
+    pub uses: HashSet<(BlockId, usize)>,
+    pub mods: HashSet<(BlockId, usize)>,
 
-    pub arg: ArgSlot,
+    pub arg: stage_2::ArgSlot,
 }
 
-impl LiftedVariable {
-    pub fn new(
-        id: LiftedVariableId,
-        origin: (LiftedBlockId, usize),
-        arg: ArgSlot,
-    ) -> LiftedVariable {
-        LiftedVariable {
+impl Variable {
+    pub fn new(id: VariableId, origin: (BlockId, usize), arg: stage_2::ArgSlot) -> Variable {
+        Variable {
             id,
             origin,
             replaces: Default::default(),
@@ -58,28 +54,24 @@ impl LiftedVariable {
         }
     }
 
-    pub fn new_replacement(
-        &self,
-        id: LiftedVariableId,
-        origin: (LiftedBlockId, usize),
-    ) -> LiftedVariable {
+    pub fn new_replacement(&self, id: VariableId, origin: (BlockId, usize)) -> Variable {
         let mut replaces = self.replaces.clone();
         replaces.insert(self.id);
 
-        let mut replacement = LiftedVariable::new(id, origin, self.arg);
+        let mut replacement = Variable::new(id, origin, self.arg);
         replacement.replaces = replaces;
         replacement
     }
 
-    pub fn add_use(&mut self, block: LiftedBlockId, instr: usize) {
+    pub fn add_use(&mut self, block: BlockId, instr: usize) {
         self.uses.insert((block, instr));
     }
 
-    pub fn add_mod(&mut self, block: LiftedBlockId, instr: usize) {
+    pub fn add_mod(&mut self, block: BlockId, instr: usize) {
         self.mods.insert((block, instr));
     }
 
-    pub fn merge(&mut self, from: LiftedVariable) {
+    pub fn merge(&mut self, from: Variable) {
         // Check so we're only merging blocks that make sense to merge
         //
         // More of a failsafe than an actual requirement, but you probably want to keep it since
@@ -104,31 +96,28 @@ impl LiftedVariable {
         self.mods.remove(&self.origin);
     }
 
-    pub fn is_aliasing_same(&self, other: &LiftedVariable) -> bool {
+    pub fn is_aliasing_same(&self, other: &Variable) -> bool {
         // Caused by write to register in an inner scope -> modification of existing variable
         other.replaces.contains(&self.id) || !other.replaces.is_disjoint(&self.replaces)
     }
 
-    pub fn is_equivalent(&self, other: &LiftedVariable) -> bool {
+    pub fn is_equivalent(&self, other: &Variable) -> bool {
         // Multiple forks ended up at the same block and created the same variable
         self.origin == other.origin && self.arg == other.arg
     }
 }
 
-impl LiftedFunction {
-    pub fn lift(p: Function<'_>) -> LiftedFunction {
+impl Function {
+    pub fn lift(p: stage_2::Function<'_>) -> Function {
         // Generate and lift all blocks
-        let mut blocks: BTreeMap<_, _> = p
-            .blocks()
-            .into_iter()
-            .map(|(id, block)| (LiftedBlockId(id), LiftedBlock::lift(block)))
-            .collect();
+        let mut blocks: BTreeMap<_, _> =
+            p.blocks().into_iter().map(|(id, block)| (BlockId(id), Block::lift(block))).collect();
 
         // Lift all constants
-        let constants: Vec<_> = p.constants.iter().copied().map(LiftedConstant::lift).collect();
+        let constants: Vec<_> = p.constants.iter().copied().map(Constant::lift).collect();
 
         // Lift all inner functions
-        let children = p.prototypes.into_iter().map(LiftedFunction::lift).collect();
+        let children = p.prototypes.into_iter().map(Function::lift).collect();
 
         // Find all slots used by the function, they're used mainly in the code below
         let mut slots = HashSet::new();
@@ -159,32 +148,35 @@ impl LiftedFunction {
         // Both ways have their own upsides and downsides and there's bound to be far more
         // alternatives that I haven't thought of.
         if let Some((&first_block_id, _)) = blocks.first_key_value() {
-            let mut regs = slots.iter().copied().filter(ArgSlot::is_reg).collect::<BTreeSet<_>>();
+            let mut regs =
+                slots.iter().copied().filter(stage_2::ArgSlot::is_reg).collect::<BTreeSet<_>>();
 
-            let mut mark_opcs: Vec<OpCode> = vec![];
+            let mut mark_opcs: Vec<stage_2::OpCode> = vec![];
 
             if p.raw.arg_count > 0 {
-                mark_opcs.push(ExtOpCode::comment(format!("args: {}", p.raw.arg_count)).into());
+                mark_opcs
+                    .push(stage_2::ExtOpCode::comment(format!("args: {}", p.raw.arg_count)).into());
                 for reg in 0..p.raw.arg_count {
                     // We want to avoid shadowing any arguments
-                    regs.remove(&ArgSlot::Register(reg as _));
+                    regs.remove(&stage_2::ArgSlot::Register(reg as _));
                 }
             }
 
             if !regs.is_empty() {
                 // TODO: Remove these comments once we start optimizing out ExtOpCode::DefineReg
-                mark_opcs.push(ExtOpCode::comment("fallback defines").into());
-                mark_opcs.extend(regs.into_iter().map(ExtOpCode::DefineReg).map(Into::into));
-                mark_opcs.push(ExtOpCode::comment("fallback defines end").into());
+                mark_opcs.push(stage_2::ExtOpCode::comment("fallback defines").into());
+                mark_opcs
+                    .extend(regs.into_iter().map(stage_2::ExtOpCode::DefineReg).map(Into::into));
+                mark_opcs.push(stage_2::ExtOpCode::comment("fallback defines end").into());
             }
 
             blocks.insert(
-                LiftedBlockId(InstructionRef::FunctionEntry),
-                LiftedBlock { instructions: mark_opcs, forks_to: vec![first_block_id] },
+                BlockId(stage_2::InstructionRef::FunctionEntry),
+                Block { instructions: mark_opcs, forks_to: vec![first_block_id] },
             );
         }
 
-        LiftedFunction {
+        Function {
             name: None,
             blocks,
             children,
@@ -199,39 +191,39 @@ impl LiftedFunction {
         self.name = Some(name.into());
     }
 
-    pub fn with_name(mut self, name: impl Into<String>) -> LiftedFunction {
+    pub fn with_name(mut self, name: impl Into<String>) -> Function {
         self.set_name(name);
         self
     }
 
-    pub fn variables(&self) -> Option<Vec<LiftedVariable>> {
+    pub fn variables(&self) -> Option<Vec<Variable>> {
         let func = self;
         let consts = &func.constants;
 
         let mut variable_id = 0;
         let mut new_var = || {
             variable_id += 1;
-            LiftedVariableId(variable_id - 1)
+            VariableId(variable_id - 1)
         };
 
         let arguments = (0..self.count_args)
             .map(|i| {
-                LiftedVariable::new(
+                Variable::new(
                     new_var(),
-                    (LiftedBlockId(InstructionRef::FunctionEntry), 0),
-                    ArgSlot::Register(i as _),
+                    (BlockId(stage_2::InstructionRef::FunctionEntry), 0),
+                    stage_2::ArgSlot::Register(i as _),
                 )
             })
             .map(|x| (x.arg, x));
 
         let mut block_stack = vec![(
             *func.blocks.first_key_value().unwrap().0,
-            LiftedBlockId(InstructionRef::FunctionEntry),
-            arguments.collect::<HashMap<ArgSlot, LiftedVariable>>(),
+            BlockId(stage_2::InstructionRef::FunctionEntry),
+            arguments.collect::<HashMap<stage_2::ArgSlot, Variable>>(),
         )];
 
         let mut used_shut = vec![];
-        let mut seen = HashSet::<(LiftedBlockId, LiftedBlockId)>::new();
+        let mut seen = HashSet::<(BlockId, BlockId)>::new();
         while let Some((block_id, origin, mut live_vars)) = block_stack.pop() {
             if !seen.insert((block_id, origin)) {
                 // If we've already taken and analyzed the origin->block_id jump, ignore it
@@ -261,15 +253,15 @@ impl LiftedFunction {
 
                 // If we run into any OpCode::Closure calls, surrender completely.
                 // Refer to the comment above.
-                if let OpCode::Closure(_, _) = instr {
+                if let stage_2::OpCode::Closure(_, _) = instr {
                     log::warn!("unsupported instruction: {}", instr.text(consts));
                     return None;
                 }
 
                 for arg in instr.args_used().into_iter().filter(|x| x.slot().is_reg()) {
                     match (arg.dir(), live_vars.get_mut(&arg)) {
-                        (ArgDir::Read, Some(x)) => x.add_use(block_id, idx),
-                        (ArgDir::Modify, Some(x)) => x.add_mod(block_id, idx),
+                        (stage_2::ArgDir::Read, Some(x)) => x.add_use(block_id, idx),
+                        (stage_2::ArgDir::Modify, Some(x)) => x.add_mod(block_id, idx),
                         _ => {
                             log::warn!("reading unwritten {} {:?} ({})", arg, block_id, idx);
                             return None;
@@ -277,8 +269,12 @@ impl LiftedFunction {
                     }
                 }
 
-                instr.args_out().into_iter().map(Arg::slot).filter(ArgSlot::is_reg).for_each(
-                    |slot| {
+                instr
+                    .args_out()
+                    .into_iter()
+                    .map(stage_2::Arg::slot)
+                    .filter(stage_2::ArgSlot::is_reg)
+                    .for_each(|slot| {
                         let id = new_var();
                         let origin = (block_id, idx);
 
@@ -288,14 +284,13 @@ impl LiftedFunction {
                             used_shut.push(var_old);
                             replacement
                         } else {
-                            LiftedVariable::new(id, origin, slot)
+                            Variable::new(id, origin, slot)
                         };
 
                         live_vars.insert(slot, var);
-                    },
-                );
+                    });
 
-                if let OpCode::Return(_, _) = instr {
+                if let stage_2::OpCode::Return(_, _) = instr {
                     used_shut.extend(live_vars.drain().map(|(_, x)| x));
                 }
             }
@@ -305,7 +300,7 @@ impl LiftedFunction {
 
         used_shut.sort_by_cached_key(|x| x.id);
 
-        let mut used_shut_merged = BTreeMap::<LiftedVariableId, LiftedVariable>::new();
+        let mut used_shut_merged = BTreeMap::<VariableId, Variable>::new();
         for used in used_shut {
             match used_shut_merged.entry(used.id) {
                 Entry::Occupied(mut e) => {
@@ -317,10 +312,12 @@ impl LiftedFunction {
         }
 
         let mut used_vars = used_shut_merged;
-        let mut usage_to_var: HashMap<(ArgDir, ArgSlot, (LiftedBlockId, usize)), LiftedVariableId> =
-            HashMap::new();
+        let mut usage_to_var: HashMap<
+            (stage_2::ArgDir, stage_2::ArgSlot, (BlockId, usize)),
+            VariableId,
+        > = HashMap::new();
 
-        let mut collisions = HashMap::<LiftedVariableId, LiftedVariableId>::new();
+        let mut collisions = HashMap::<VariableId, VariableId>::new();
 
         for var in used_vars.values() {
             let mut register = |dir, origin| {
@@ -334,14 +331,14 @@ impl LiftedFunction {
                     .or_insert(var.id);
             };
 
-            register(ArgDir::Write, var.origin);
+            register(stage_2::ArgDir::Write, var.origin);
 
             for origin in var.uses.iter().copied() {
-                register(ArgDir::Read, origin);
+                register(stage_2::ArgDir::Read, origin);
             }
 
             for origin in var.mods.iter().copied() {
-                register(ArgDir::Modify, origin);
+                register(stage_2::ArgDir::Modify, origin);
             }
         }
 
@@ -451,7 +448,7 @@ impl LiftedFunction {
     }
 }
 
-impl LiftedFunction {
+impl Function {
     pub fn optimize_until_complete(&mut self) -> Vec<usize> {
         (0..).map(|_| self.optimize()).take_while(|&s| s != 0).collect()
     }
@@ -466,7 +463,7 @@ impl LiftedFunction {
     }
 
     fn opt_funcs(&mut self) -> usize {
-        self.children.iter_mut().map(LiftedFunction::optimize).sum()
+        self.children.iter_mut().map(Function::optimize).sum()
     }
 
     fn opt_blocks(&mut self) -> usize {
@@ -539,7 +536,7 @@ impl LiftedFunction {
 
     fn opt_merge_sequential_blocks(&mut self) -> usize {
         let mut score = 0;
-        let mut block_to_origin = HashMap::<LiftedBlockId, Vec<LiftedBlockId>>::new();
+        let mut block_to_origin = HashMap::<BlockId, Vec<BlockId>>::new();
 
         for (&origin, block) in self.blocks.iter() {
             for forks_to in block.forks_to.iter().copied() {
@@ -553,7 +550,7 @@ impl LiftedFunction {
             // If the block only has one origin
             if let [mut origin_id] = *origins {
                 // If we're considering merging into FunctionEntry, don't do it
-                if origin_id == LiftedBlockId(InstructionRef::FunctionEntry) {
+                if origin_id == BlockId(stage_2::InstructionRef::FunctionEntry) {
                     continue;
                 }
 
@@ -604,10 +601,13 @@ impl LiftedFunction {
                 };
 
                 let (dst, idx) = match block.instructions[created] {
-                    OpCode::Closure(dst, Arg(_, ArgSlot::FnConstant(idx))) => (dst, idx),
-                    OpCode::Custom(ExtOpCode::Closure(
+                    stage_2::OpCode::Closure(
                         dst,
-                        Arg(_, ArgSlot::FnConstant(idx)),
+                        stage_2::Arg(_, stage_2::ArgSlot::FnConstant(idx)),
+                    ) => (dst, idx),
+                    stage_2::OpCode::Custom(stage_2::ExtOpCode::Closure(
+                        dst,
+                        stage_2::Arg(_, stage_2::ArgSlot::FnConstant(idx)),
                         _,
                     )) => (dst, idx),
                     _ => continue,
@@ -615,20 +615,21 @@ impl LiftedFunction {
 
                 for used in var.uses {
                     match block.instructions[used] {
-                        OpCode::SetGlobal(src, Arg(_, ArgSlot::Constant(g))) if src == dst => {
+                        stage_2::OpCode::SetGlobal(
+                            src,
+                            stage_2::Arg(_, stage_2::ArgSlot::Constant(g)),
+                        ) if src == dst => {
                             match (
                                 self.children.get_mut(idx as usize),
                                 self.constants.get(g.0 as usize),
                             ) {
-                                (Some(func), Some(LiftedConstant::String(cnst))) => {
-                                    match &func.name {
-                                        Some(name) if name == cnst => continue,
-                                        Some(name) if name != cnst => panic!("multiple names"),
-                                        _ => {
-                                            score += 1;
-                                            func.set_name(cnst)
-                                        },
-                                    }
+                                (Some(func), Some(Constant::String(cnst))) => match &func.name {
+                                    Some(name) if name == cnst => continue,
+                                    Some(name) if name != cnst => panic!("multiple names"),
+                                    _ => {
+                                        score += 1;
+                                        func.set_name(cnst)
+                                    },
                                 },
                                 _ => continue,
                             }
@@ -644,39 +645,39 @@ impl LiftedFunction {
 }
 
 #[derive(Debug, PartialEq)]
-pub enum LiftedConstant {
+pub enum Constant {
     Nil,
     Bool(bool),
     Number(f64),
     String(String),
 }
 
-impl LiftedConstant {
-    pub fn lift(p: &raw::LuaConstant) -> LiftedConstant {
+impl Constant {
+    pub fn lift(p: &stage_1::LuaConstant) -> Constant {
         match p {
-            raw::LuaConstant::Nil => LiftedConstant::Nil,
-            &raw::LuaConstant::Bool(x) => LiftedConstant::Bool(x),
-            raw::LuaConstant::Number(x) => LiftedConstant::Number(x.0),
-            raw::LuaConstant::String(x) => LiftedConstant::String(x.to_string()),
+            stage_1::LuaConstant::Nil => Constant::Nil,
+            &stage_1::LuaConstant::Bool(x) => Constant::Bool(x),
+            stage_1::LuaConstant::Number(x) => Constant::Number(x.0),
+            stage_1::LuaConstant::String(x) => Constant::String(x.to_string()),
         }
         //
     }
 }
 
-impl std::fmt::Display for LiftedConstant {
+impl std::fmt::Display for Constant {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LiftedConstant::Nil => write!(f, "nil"),
-            LiftedConstant::Bool(b) => b.fmt(f),
-            LiftedConstant::Number(n) => n.fmt(f),
-            LiftedConstant::String(s) => <String as std::fmt::Debug>::fmt(s, f),
+            Constant::Nil => write!(f, "nil"),
+            Constant::Bool(b) => b.fmt(f),
+            Constant::Number(n) => n.fmt(f),
+            Constant::String(s) => <String as std::fmt::Debug>::fmt(s, f),
         }
     }
 }
 
 #[derive(Debug, Hash, PartialEq, Eq)]
 pub struct LifetimeVariable {
-    pub arg: ArgSlot,
+    pub arg: stage_2::ArgSlot,
     pub created: Option<usize>,
     pub deleted: Option<usize>,
     pub uses: Vec<usize>,
@@ -684,26 +685,26 @@ pub struct LifetimeVariable {
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct LifetimeBlock {
-    pub imported: HashSet<ArgSlot>,
-    pub exported: HashSet<ArgSlot>,
+    pub imported: HashSet<stage_2::ArgSlot>,
+    pub exported: HashSet<stage_2::ArgSlot>,
     pub vars: Vec<LifetimeVariable>,
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
-pub struct LiftedBlock {
-    pub instructions: Vec<OpCode>,
-    pub forks_to: Vec<LiftedBlockId>,
+pub struct Block {
+    pub instructions: Vec<stage_2::OpCode>,
+    pub forks_to: Vec<BlockId>,
 }
 
-impl LiftedBlock {
-    pub fn lift(p: Block<'_, '_>) -> LiftedBlock {
+impl Block {
+    pub fn lift(p: stage_2::Block<'_, '_>) -> Block {
         let instructions = p.instructions.into_iter().map(|x| x.op_code.clone()).collect();
-        let forks_to = p.forks_to.into_iter().map(|i| LiftedBlockId(i.addr)).collect();
+        let forks_to = p.forks_to.into_iter().map(|i| BlockId(i.addr)).collect();
 
-        LiftedBlock { instructions, forks_to }
+        Block { instructions, forks_to }
     }
 
-    pub fn merge(&mut self, id: LiftedBlockId, block: LiftedBlock) {
+    pub fn merge(&mut self, id: BlockId, block: Block) {
         if self.forks_to != [id] {
             panic!("invalid merge: {:?} != [{:?}]", self.forks_to, id);
         }
@@ -712,24 +713,24 @@ impl LiftedBlock {
         self.forks_to = block.forks_to;
     }
 
-    pub fn push_front(&mut self, i: impl IntoIterator<Item = impl Into<OpCode>>) {
+    pub fn push_front(&mut self, i: impl IntoIterator<Item = impl Into<stage_2::OpCode>>) {
         self.instructions.splice(0..0, i.into_iter().map(Into::into));
     }
 
-    pub fn push_back(&mut self, i: impl IntoIterator<Item = impl Into<OpCode>>) {
+    pub fn push_back(&mut self, i: impl IntoIterator<Item = impl Into<stage_2::OpCode>>) {
         self.instructions.extend(i.into_iter().map(Into::into));
     }
 }
 
-impl LiftedBlock {
-    pub fn optimize(&mut self, protos: &[LiftedFunction]) -> usize {
+impl Block {
+    pub fn optimize(&mut self, protos: &[Function]) -> usize {
         self.opt_custom_opcodes(protos)
             + self.opt_eliminate_oneshot_variables()
             + self.opt_eliminate_identical_forks()
             + self.opt_eliminate_nop()
     }
 
-    fn opt_custom_opcodes(&mut self, protos: &[LiftedFunction]) -> usize {
+    fn opt_custom_opcodes(&mut self, protos: &[Function]) -> usize {
         let mut score = 0;
         let mut instructions = Vec::with_capacity(self.instructions.len());
 
@@ -738,21 +739,28 @@ impl LiftedBlock {
         while let Some(instr) = drain.next() {
             match instr {
                 // Rewrite OpCode::Closure and the slot allocations following it into our own equivalent
-                OpCode::Closure(dest, Arg(dir, ArgSlot::FnConstant(cidx))) => {
+                stage_2::OpCode::Closure(
+                    dest,
+                    stage_2::Arg(dir, stage_2::ArgSlot::FnConstant(cidx)),
+                ) => {
                     let upvc = protos[cidx as usize].count_upvals.into();
                     let mut upvs = vec![];
 
                     for _ in 0..upvc {
                         match drain.next() {
-                            Some(OpCode::Move(_, src)) => upvs.push(src),
-                            Some(OpCode::GetUpVal(_, src)) => upvs.push(src),
+                            Some(stage_2::OpCode::Move(_, src)) => upvs.push(src),
+                            Some(stage_2::OpCode::GetUpVal(_, src)) => upvs.push(src),
                             None => panic!("ran out of instructions while constructing closure"),
                             _ => panic!("unexpected instruction while constructing closure"),
                         }
                     }
 
-                    let op = ExtOpCode::Closure(dest, Arg(dir, ArgSlot::FnConstant(cidx)), upvs);
-                    instructions.push(OpCode::Custom(op));
+                    let op = stage_2::ExtOpCode::Closure(
+                        dest,
+                        stage_2::Arg(dir, stage_2::ArgSlot::FnConstant(cidx)),
+                        upvs,
+                    );
+                    instructions.push(stage_2::OpCode::Custom(op));
 
                     score += 1;
                 },
@@ -778,10 +786,10 @@ impl LiftedBlock {
         // Only retain opcodes that aren't ONLY branching
         #[allow(clippy::match_like_matches_macro)]
         self.instructions.retain(|op_code| match op_code {
-            OpCode::Jmp(_) => false,
-            OpCode::LessThan(_, _, _) => false,
-            OpCode::Equals(_, _, _) => false,
-            OpCode::Custom(ExtOpCode::Nop) => false,
+            stage_2::OpCode::Jmp(_) => false,
+            stage_2::OpCode::LessThan(_, _, _) => false,
+            stage_2::OpCode::Equals(_, _, _) => false,
+            stage_2::OpCode::Custom(stage_2::ExtOpCode::Nop) => false,
             _ => true,
         });
 
@@ -819,28 +827,54 @@ impl LiftedBlock {
                 log::trace!("only used once: {} ({} -> {})", arg, created, uses[0]);
 
                 let (solo_arg, used_arg) = match self.instructions.get(created) {
-                    Some(&OpCode::GetGlobal(Arg(_, dst), Arg(_, ArgSlot::Constant(cid)))) => {
-                        (dst, ArgSlot::Global(cid))
-                    },
-                    Some(&OpCode::LoadK(
-                        Arg(_, dst @ ArgSlot::Register(_)),
-                        Arg(_, cid @ ArgSlot::Constant(_)),
+                    Some(&stage_2::OpCode::GetGlobal(
+                        stage_2::Arg(_, dst),
+                        stage_2::Arg(_, stage_2::ArgSlot::Constant(cid)),
+                    )) => (dst, stage_2::ArgSlot::Global(cid)),
+                    Some(&stage_2::OpCode::LoadK(
+                        stage_2::Arg(_, dst @ stage_2::ArgSlot::Register(_)),
+                        stage_2::Arg(_, cid @ stage_2::ArgSlot::Constant(_)),
                     )) => (dst, cid),
                     _ => continue,
                 };
 
                 let swappable_args = match self.instructions.get_mut(used) {
-                    Some(OpCode::SetGlobal(Arg(_, src), _)) => vec![src],
-                    Some(OpCode::GetTable(_, Arg(_, tbl), Arg(_, idx))) => vec![tbl, idx],
-                    Some(OpCode::SetTable(Arg(_, tbl), Arg(_, idx), Arg(_, val))) => {
+                    Some(stage_2::OpCode::SetGlobal(stage_2::Arg(_, src), _)) => vec![src],
+                    Some(stage_2::OpCode::GetTable(
+                        _,
+                        stage_2::Arg(_, tbl),
+                        stage_2::Arg(_, idx),
+                    )) => {
+                        vec![tbl, idx]
+                    },
+                    Some(stage_2::OpCode::SetTable(
+                        stage_2::Arg(_, tbl),
+                        stage_2::Arg(_, idx),
+                        stage_2::Arg(_, val),
+                    )) => {
                         vec![tbl, idx, val]
                     },
-                    Some(OpCode::SetUpVal(Arg(_, val), _)) => vec![val],
+                    Some(stage_2::OpCode::SetUpVal(stage_2::Arg(_, val), _)) => vec![val],
                     // Comparisons
-                    Some(OpCode::Equals(_, Arg(_, lhs), Arg(_, rhs))) => vec![lhs, rhs],
-                    Some(OpCode::LessThan(_, Arg(_, lhs), Arg(_, rhs))) => vec![lhs, rhs],
-                    Some(OpCode::LessThanOrEquals(_, Arg(_, lhs), Arg(_, rhs))) => vec![lhs, rhs],
-                    // Some(LiftedOpCode(OpCode::Call()))
+                    Some(stage_2::OpCode::Equals(
+                        _,
+                        stage_2::Arg(_, lhs),
+                        stage_2::Arg(_, rhs),
+                    )) => {
+                        vec![lhs, rhs]
+                    },
+                    Some(stage_2::OpCode::LessThan(
+                        _,
+                        stage_2::Arg(_, lhs),
+                        stage_2::Arg(_, rhs),
+                    )) => {
+                        vec![lhs, rhs]
+                    },
+                    Some(stage_2::OpCode::LessThanOrEquals(
+                        _,
+                        stage_2::Arg(_, lhs),
+                        stage_2::Arg(_, rhs),
+                    )) => vec![lhs, rhs],
                     _ => continue,
                 };
 
@@ -850,7 +884,7 @@ impl LiftedBlock {
                     }
                 }
 
-                self.instructions[created] = OpCode::Custom(ExtOpCode::Nop);
+                self.instructions[created] = stage_2::OpCode::Custom(stage_2::ExtOpCode::Nop);
                 score += 1;
             }
         }
@@ -859,20 +893,20 @@ impl LiftedBlock {
     }
 }
 
-fn lifetime_analysis(instructions: &[OpCode]) -> Option<LifetimeBlock> {
+fn lifetime_analysis(instructions: &[stage_2::OpCode]) -> Option<LifetimeBlock> {
     let mut imported = HashSet::new();
     let mut exported = HashSet::new();
 
     // Vec<(Arg, from, Vec<uses>)
     let mut used_shut = vec![];
-    let mut used_open = HashMap::<ArgSlot, (Option<usize>, Vec<usize>)>::new();
+    let mut used_open = HashMap::<stage_2::ArgSlot, (Option<usize>, Vec<usize>)>::new();
 
     for (idx, instr) in instructions.iter().enumerate() {
-        for Arg(_, slot) in instr.args_used().into_iter() {
+        for crate::Arg(_, slot) in instr.args_used().into_iter() {
             used_open.entry(slot).or_default().1.push(idx);
         }
 
-        for Arg(_, slot) in instr.args_out() {
+        for stage_2::Arg(_, slot) in instr.args_out() {
             // Register a new create
             let old_use = used_open.insert(slot, (Some(idx), vec![]));
 
@@ -882,7 +916,7 @@ fn lifetime_analysis(instructions: &[OpCode]) -> Option<LifetimeBlock> {
             };
         }
 
-        if let OpCode::Return(_, _) = instr {
+        if let stage_2::OpCode::Return(_, _) = instr {
             for (arg, (from, uses)) in used_open.drain() {
                 used_shut.push((arg, from, Some(idx), uses))
             }
