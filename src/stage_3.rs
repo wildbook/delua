@@ -1,11 +1,10 @@
 use shrinkwraprs::Shrinkwrap;
-use std::collections::{btree_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::btree_map::Entry;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use crate::{
-    stage_1 as s1,
-    stage_2::{self as s2, OpInfo},
-    util::discard,
-};
+use crate::stage_1 as s1;
+use crate::stage_2::{self as s2, OpInfo};
+use crate::util::discard;
 
 #[derive(Shrinkwrap, Debug, Eq, PartialEq, Clone, Copy, PartialOrd, Ord, Hash)]
 pub struct BlockId(pub s2::InstructionRef);
@@ -25,9 +24,7 @@ pub struct Function {
 pub struct VariableId(usize);
 
 impl std::fmt::Display for VariableId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { self.0.fmt(f) }
 }
 
 #[derive(Debug, Clone)]
@@ -63,13 +60,9 @@ impl Variable {
         replacement
     }
 
-    pub fn add_use(&mut self, block: BlockId, instr: usize) {
-        self.uses.insert((block, instr));
-    }
+    pub fn add_use(&mut self, block: BlockId, instr: usize) { self.uses.insert((block, instr)); }
 
-    pub fn add_mod(&mut self, block: BlockId, instr: usize) {
-        self.mods.insert((block, instr));
-    }
+    pub fn add_mod(&mut self, block: BlockId, instr: usize) { self.mods.insert((block, instr)); }
 
     pub fn merge(&mut self, from: Variable) {
         // Check so we're only merging blocks that make sense to merge
@@ -185,9 +178,7 @@ impl Function {
         }
     }
 
-    pub fn set_name(&mut self, name: impl Into<String>) {
-        self.name = Some(name.into());
-    }
+    pub fn set_name(&mut self, name: impl Into<String>) { self.name = Some(name.into()); }
 
     pub fn with_name(mut self, name: impl Into<String>) -> Function {
         self.set_name(name);
@@ -458,9 +449,7 @@ impl Function {
             + self.opt_guess_names()
     }
 
-    fn opt_funcs(&mut self) -> usize {
-        self.children.iter_mut().map(Function::optimize).sum()
-    }
+    fn opt_funcs(&mut self) -> usize { self.children.iter_mut().map(Function::optimize).sum() }
 
     fn opt_blocks(&mut self) -> usize {
         let children = &self.children[..];

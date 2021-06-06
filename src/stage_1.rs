@@ -1,4 +1,5 @@
-use std::{hash::Hash, io::Read};
+use std::hash::Hash;
+use std::io::Read;
 
 type Result<T> = std::result::Result<T, std::io::Error>;
 
@@ -137,9 +138,7 @@ impl<'a> std::fmt::Display for LuaString {
 pub struct LuaNumber(pub f64);
 
 impl<'a> std::fmt::Display for LuaNumber {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", self.0) }
 }
 
 impl LuaReader for LuaNumber {
@@ -293,24 +292,12 @@ impl LuaReader for LuaConstant {
 pub struct LuaInstruction(u32);
 
 impl LuaInstruction {
-    pub fn op(&self) -> u32 {
-        self.0 & 0x3F
-    }
-    pub fn a(&self) -> u32 {
-        self.0 >> 6 & 0xFF
-    }
-    pub fn b(&self) -> u32 {
-        self.0 >> 23 & 0x1FF
-    }
-    pub fn c(&self) -> u32 {
-        self.0 >> 14 & 0x1FF
-    }
-    pub fn bx(&self) -> u32 {
-        self.0 >> 14 & 0x7FFFF
-    }
-    pub fn bx_s(&self) -> i32 {
-        self.bx() as i32 - 0x1FFFF
-    }
+    pub fn op(&self) -> u32 { self.0 & 0x3F }
+    pub fn a(&self) -> u32 { self.0 >> 6 & 0xFF }
+    pub fn b(&self) -> u32 { self.0 >> 23 & 0x1FF }
+    pub fn c(&self) -> u32 { self.0 >> 14 & 0x1FF }
+    pub fn bx(&self) -> u32 { self.0 >> 14 & 0x7FFFF }
+    pub fn bx_s(&self) -> i32 { self.bx() as i32 - 0x1FFFF }
 }
 
 impl LuaReader for LuaInstruction {

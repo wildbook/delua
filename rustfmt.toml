@@ -1,9 +1,10 @@
 edition = "2018"
 
+imports_granularity = "Module"
 match_block_trailing_comma = true
-imports_granularity = "Crate"
 use_field_init_shorthand = true
 use_small_heuristics = "Max"
 
 unstable_features = true
+fn_single_line = true
 inline_attribute_width = 75

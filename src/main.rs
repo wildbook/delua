@@ -1,10 +1,8 @@
 #![feature(array_windows)]
 #![feature(map_first_last)]
 
-use std::{
-    collections::HashMap,
-    io::{BufWriter, Cursor, Write},
-};
+use std::collections::HashMap;
+use std::io::{BufWriter, Cursor, Write};
 
 use itertools::Itertools;
 

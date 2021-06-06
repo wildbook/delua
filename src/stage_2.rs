@@ -3,7 +3,8 @@ use std::collections::{hash_map, HashMap, HashSet};
 use itertools::Itertools;
 use shrinkwraprs::Shrinkwrap;
 
-use crate::{stage_1 as s1, stage_3 as s3, util::IgnoreDebug};
+use crate::util::IgnoreDebug;
+use crate::{stage_1 as s1, stage_3 as s3};
 
 pub trait OpInfo {
     fn text(&self, constants: &[s3::Constant]) -> String {
@@ -46,15 +47,11 @@ pub enum ExtOpCode {
 }
 
 impl ExtOpCode {
-    pub fn comment(str: impl Into<String>) -> ExtOpCode {
-        ExtOpCode::Comment(str.into())
-    }
+    pub fn comment(str: impl Into<String>) -> ExtOpCode { ExtOpCode::Comment(str.into()) }
 }
 
 impl From<ExtOpCode> for OpCode {
-    fn from(val: ExtOpCode) -> Self {
-        OpCode::Custom(val)
-    }
+    fn from(val: ExtOpCode) -> Self { OpCode::Custom(val) }
 }
 
 impl OpInfo for ExtOpCode {
@@ -517,37 +514,19 @@ pub enum ArgSlot {
 pub struct Arg(pub ArgDir, #[shrinkwrap(main_field)] pub ArgSlot);
 
 impl std::fmt::Display for Arg {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.1.fmt(f)
-    }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { self.1.fmt(f) }
 }
 
 impl Arg {
-    pub fn read(slot: ArgSlot) -> Arg {
-        Arg(ArgDir::Read, slot)
-    }
-
-    pub fn modify(slot: ArgSlot) -> Arg {
-        Arg(ArgDir::Modify, slot)
-    }
-
-    pub fn write(slot: ArgSlot) -> Arg {
-        Arg(ArgDir::Write, slot)
-    }
-
-    pub fn slot(self) -> ArgSlot {
-        self.1
-    }
-
-    pub fn dir(self) -> ArgDir {
-        self.0
-    }
+    pub fn read(slot: ArgSlot) -> Arg { Arg(ArgDir::Read, slot) }
+    pub fn modify(slot: ArgSlot) -> Arg { Arg(ArgDir::Modify, slot) }
+    pub fn write(slot: ArgSlot) -> Arg { Arg(ArgDir::Write, slot) }
+    pub fn slot(self) -> ArgSlot { self.1 }
+    pub fn dir(self) -> ArgDir { self.0 }
 }
 
 impl ArgSlot {
-    pub fn is_reg(&self) -> bool {
-        matches!(self, ArgSlot::Register(_))
-    }
+    pub fn is_reg(&self) -> bool { matches!(self, ArgSlot::Register(_)) }
 
     pub fn text(&self, consts: &[s3::Constant]) -> String {
         match self {
@@ -580,9 +559,7 @@ impl<'a> std::fmt::Display for ArgSlot {
 }
 
 impl<'a> ArgSlot {
-    pub fn constant(index: u32) -> ArgSlot {
-        ArgSlot::Constant(ConstantId(index))
-    }
+    pub fn constant(index: u32) -> ArgSlot { ArgSlot::Constant(ConstantId(index)) }
 
     pub fn const_or_reg(index: u32) -> ArgSlot {
         match index & (1 << 8) {
@@ -610,9 +587,7 @@ impl std::fmt::Display for InstructionRef {
 }
 
 impl InstructionRef {
-    pub fn is_instruction_idx(&self) -> bool {
-        matches!(self, InstructionRef::Instruction(_))
-    }
+    pub fn is_instruction_idx(&self) -> bool { matches!(self, InstructionRef::Instruction(_)) }
 }
 
 #[derive(Clone, Debug)]
@@ -873,13 +848,9 @@ impl<'a> Function<'a> {
         self.has_basic_src(instr) && self.has_basic_dst(instr)
     }
 
-    pub fn has_basic_src(&self, instr: &Instruction<'a>) -> bool {
-        self.get_src(&instr).len() == 1
-    }
+    pub fn has_basic_src(&self, instr: &Instruction<'a>) -> bool { self.get_src(&instr).len() == 1 }
 
-    pub fn has_basic_dst(&self, instr: &Instruction<'a>) -> bool {
-        self.get_dst(instr).len() == 1
-    }
+    pub fn has_basic_dst(&self, instr: &Instruction<'a>) -> bool { self.get_dst(instr).len() == 1 }
 
     pub fn basic_dst(&self, instr: &Instruction<'a>) -> Option<&Instruction<'a>> {
         match *self.get_dst(&instr) {
