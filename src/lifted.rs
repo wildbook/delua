@@ -1,9 +1,5 @@
-use std::collections::{
-    btree_map::{self, Entry},
-    BTreeMap, HashMap, HashSet,
-};
-
 use shrinkwraprs::Shrinkwrap;
+use std::collections::{btree_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::{
     parsed::{Arg, ArgDir, ArgSlot, Block, ExtOpCode, Function, InstructionRef, OpCode, OpInfo},
@@ -22,6 +18,7 @@ pub struct LiftedFunction {
     pub constants: Vec<LiftedConstant>,
     pub count_upvals: u8,
     pub count_args: u8,
+    pub used_slots: HashSet<ArgSlot>,
 }
 
 #[derive(Shrinkwrap, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -36,8 +33,9 @@ impl std::fmt::Display for LiftedVariableId {
 #[derive(Debug, Clone)]
 pub struct LiftedVariable {
     pub id: LiftedVariableId,
-    pub replaces_id: Option<LiftedVariableId>,
     pub origin: (LiftedBlockId, usize),
+
+    pub replaces: BTreeSet<LiftedVariableId>,
     pub uses: HashSet<(LiftedBlockId, usize)>,
     pub mods: HashSet<(LiftedBlockId, usize)>,
 
@@ -52,12 +50,25 @@ impl LiftedVariable {
     ) -> LiftedVariable {
         LiftedVariable {
             id,
-            replaces_id: None,
             origin,
+            replaces: Default::default(),
             uses: Default::default(),
             mods: Default::default(),
             arg,
         }
+    }
+
+    pub fn new_replacement(
+        &self,
+        id: LiftedVariableId,
+        origin: (LiftedBlockId, usize),
+    ) -> LiftedVariable {
+        let mut replaces = self.replaces.clone();
+        replaces.insert(self.id);
+
+        let mut replacement = LiftedVariable::new(id, origin, self.arg);
+        replacement.replaces = replaces;
+        replacement
     }
 
     pub fn add_use(&mut self, block: LiftedBlockId, instr: usize) {
@@ -73,9 +84,13 @@ impl LiftedVariable {
         //
         // More of a failsafe than an actual requirement, but you probably want to keep it since
         // if it gets hit something is most likely wrong somewhere.
-        if !self.is_replacement(&from) && !self.is_equivalent(&from) {
+        if !self.is_aliasing_same(&from) && !self.is_equivalent(&from) {
             log::warn!("strange merge:\n{:?}\n{:?}", self, from);
         }
+
+        // Anything `from` replaced we also replace, except ourselves
+        self.replaces.extend(from.replaces);
+        self.replaces.remove(&self.id);
 
         // Register the merged block's creation as a modification to the existing variable
         self.mods.insert(from.origin);
@@ -83,11 +98,15 @@ impl LiftedVariable {
         // All uses and mods the block we're merging has are now ours
         self.uses.extend(from.uses);
         self.mods.extend(from.mods);
+
+        // If we now have uses/mods markers from our own origin, we want to get rid of those
+        self.uses.remove(&self.origin);
+        self.mods.remove(&self.origin);
     }
 
-    pub fn is_replacement(&self, other: &LiftedVariable) -> bool {
+    pub fn is_aliasing_same(&self, other: &LiftedVariable) -> bool {
         // Caused by write to register in an inner scope -> modification of existing variable
-        Some(self.id) == other.replaces_id || self.replaces_id == other.replaces_id
+        other.replaces.contains(&self.id) || !other.replaces.is_disjoint(&self.replaces)
     }
 
     pub fn is_equivalent(&self, other: &LiftedVariable) -> bool {
@@ -99,7 +118,7 @@ impl LiftedVariable {
 impl LiftedFunction {
     pub fn lift(p: Function<'_>) -> LiftedFunction {
         // Generate and lift all blocks
-        let blocks = p
+        let mut blocks: BTreeMap<_, _> = p
             .blocks()
             .into_iter()
             .map(|(id, block)| (LiftedBlockId(id), LiftedBlock::lift(block)))
@@ -111,6 +130,60 @@ impl LiftedFunction {
         // Lift all inner functions
         let children = p.prototypes.into_iter().map(LiftedFunction::lift).collect();
 
+        // Find all slots used by the function, they're used mainly in the code below
+        let mut slots = HashSet::new();
+        for block in blocks.values() {
+            for instr in block.instructions.iter() {
+                slots.extend(instr.args_in().into_iter().map(|x| x.slot()));
+                slots.extend(instr.args_inout().into_iter().map(|x| x.slot()));
+                slots.extend(instr.args_out().into_iter().map(|x| x.slot()));
+            }
+        }
+
+        // TODO: Get rid of function fallback `ExtOpCode::DefineReg`s
+        // This is a ""temporary"" way to handle variables that are used in a deeper scope than
+        // the one they're defined in. Think for example this:
+        //
+        // ```lua
+        // local x
+        // if false then x = 10 else x = 20 end
+        // return x
+        // ```
+        //
+        // There's two main ways to get rid of this:
+        //  - At merge, determine which block the variable is most likely defined in and inject
+        //    a DefineReg instruction at the start/end of it.
+        //  - Keep the code below, but write an opt pass that moves all DefineReg instances to
+        //    the block they're most likely supposed to be in.
+        //
+        // Both ways have their own upsides and downsides and there's bound to be far more
+        // alternatives that I haven't thought of.
+        if let Some((&first_block_id, _)) = blocks.first_key_value() {
+            let mut regs = slots.iter().copied().filter(ArgSlot::is_reg).collect::<BTreeSet<_>>();
+
+            let mut mark_opcs: Vec<OpCode> = vec![];
+
+            if p.raw.arg_count > 0 {
+                mark_opcs.push(ExtOpCode::comment(format!("args: {}", p.raw.arg_count)).into());
+                for reg in 0..p.raw.arg_count {
+                    // We want to avoid shadowing any arguments
+                    regs.remove(&ArgSlot::Register(reg as _));
+                }
+            }
+
+            if !regs.is_empty() {
+                // TODO: Remove these comments once we start optimizing out ExtOpCode::DefineReg
+                mark_opcs.push(ExtOpCode::comment("fallback defines").into());
+                mark_opcs.extend(regs.into_iter().map(ExtOpCode::DefineReg).map(Into::into));
+                mark_opcs.push(ExtOpCode::comment("fallback defines end").into());
+            }
+
+            blocks.insert(
+                LiftedBlockId(InstructionRef::FunctionEntry),
+                LiftedBlock { instructions: mark_opcs, forks_to: vec![first_block_id] },
+            );
+        }
+
         LiftedFunction {
             name: None,
             blocks,
@@ -118,6 +191,7 @@ impl LiftedFunction {
             constants,
             count_upvals: p.raw.up_val_count,
             count_args: p.raw.arg_count,
+            used_slots: slots,
         }
     }
 
@@ -166,7 +240,8 @@ impl LiftedFunction {
                 // very obscure edge case in loops where lifetimes aren't propagated properly,
                 // start looking at whether this code is the problem or not.
 
-                // If we hit a loop, close all variables we're holding
+                // If we hit a loop, close all variables we're holding.
+                // They'll eventually be merged into their originals later.
                 used_shut.extend(live_vars.drain().map(|(_, x)| x));
                 continue;
             }
@@ -177,13 +252,18 @@ impl LiftedFunction {
 
             let instructions = &block.instructions;
             for (idx, instr) in instructions.iter().enumerate() {
-                // If we run into any of these instructions, surrender completely for now
-                match instr {
-                    x @ OpCode::Closure(_, _) | x @ OpCode::Close(_) => {
-                        log::warn!("unsupported instruction: {}", x.text(consts));
-                        return None;
-                    },
-                    _ => {},
+                // TODO: Make a decision about closure upvalue handling.
+                // We might want to handle closure upvalues a bit specially, so they can't be
+                // eliminated due to "not being used" when they're in reality used in the
+                // closure. Or, we can just panic on them and tell people to run the opt pass that
+                // replaces them with our own custom instruction instead. The latter of those two
+                // options is what we're doing right now.
+
+                // If we run into any OpCode::Closure calls, surrender completely.
+                // Refer to the comment above.
+                if let OpCode::Closure(_, _) = instr {
+                    log::warn!("unsupported instruction: {}", instr.text(consts));
+                    return None;
                 }
 
                 for arg in instr.args_used().into_iter().filter(|x| x.slot().is_reg()) {
@@ -199,13 +279,17 @@ impl LiftedFunction {
 
                 instr.args_out().into_iter().map(Arg::slot).filter(ArgSlot::is_reg).for_each(
                     |slot| {
-                        let mut var = LiftedVariable::new(new_var(), (block_id, idx), slot);
+                        let id = new_var();
+                        let origin = (block_id, idx);
 
-                        // If a var using this write exists, close it
-                        if let Some(var_old) = live_vars.remove(&slot) {
-                            var.replaces_id = Some(var_old.id);
+                        // If a var using this write exists, replace and close it
+                        let var = if let Some(var_old) = live_vars.remove(&slot) {
+                            let replacement = var_old.new_replacement(id, (block_id, idx));
                             used_shut.push(var_old);
-                        }
+                            replacement
+                        } else {
+                            LiftedVariable::new(id, origin, slot)
+                        };
 
                         live_vars.insert(slot, var);
                     },
@@ -236,7 +320,7 @@ impl LiftedFunction {
         let mut usage_to_var: HashMap<(ArgDir, ArgSlot, (LiftedBlockId, usize)), LiftedVariableId> =
             HashMap::new();
 
-        let mut aliases = HashMap::<LiftedVariableId, LiftedVariableId>::new();
+        let mut collisions = HashMap::<LiftedVariableId, LiftedVariableId>::new();
 
         for var in used_vars.values() {
             let mut register = |dir, origin| {
@@ -244,7 +328,7 @@ impl LiftedFunction {
                     .entry((dir, var.arg, origin))
                     .and_modify(|x| {
                         if var.id != *x {
-                            aliases.insert(var.id, *x);
+                            collisions.insert(var.id, *x);
                         }
                     })
                     .or_insert(var.id);
@@ -261,23 +345,106 @@ impl LiftedFunction {
             }
         }
 
-        dbg!(&aliases);
+        // dbg!(&collisions);
         // dbg!(&usage_to_var);
+        let mut merged = HashMap::new();
 
-        let mut alias_flat = HashMap::new();
-        for (from, mut to) in aliases {
-            while let Some(&id) = alias_flat.get(&to) {
-                to = id;
+        for (mut from, mut to) in collisions {
+            // If we've already re-aliased the `from` variable, resolve it to what it's called now
+            while let Some(&root) = merged.get(&from) {
+                from = root;
             }
 
-            alias_flat.insert(from, to);
-        }
+            // If we've already re-aliased the `to` variable, resolve it to what it's called now
+            while let Some(&root) = merged.get(&to) {
+                to = root;
+            }
 
-        for (from, to) in alias_flat {
-            log::debug!("merging {} into {}", from, to);
-            let x = used_vars.remove(&from).expect("alias from nonexistent block");
-            let to = used_vars.get_mut(&to).expect("alias to nonexistent block");
-            to.merge(x);
+            if from == to {
+                // If both variables have already been aliased to the same variable, there's not
+                // a whole lot left for us to take care of, so we'll just ignore it completely.
+                continue;
+            }
+
+            log::debug!("investigating merge (overlap: {} v {})", from, to);
+
+            let mut n1 = used_vars.remove(&from).expect("n1 alias from nonexistent variable");
+            let mut n2 = used_vars.remove(&to).expect("n2 alias to nonexistent variable");
+
+            match () {
+                () if n1.is_equivalent(&n2) => {
+                    log::debug!("merging {} into {} (equivalent)", n2.id, n1.id);
+
+                    merged.insert(n2.id, n1.id);
+                    n1.merge(n2);
+                    used_vars.insert(n1.id, n1);
+                },
+                () => {
+                    let mut root_id = match n1.replaces.intersection(&n2.replaces).last() {
+                        Some(&root_id) => root_id,
+                        // TODO: Make sure it's sound to take these two branches. It *should* be.
+                        // If one of the vars aliases the other, assume they're the same var
+                        _ if n1.replaces.contains(&n2.id) => n2.id,
+                        _ if n2.replaces.contains(&n1.id) => n1.id,
+                        // Emergency fallback
+                        _ => {
+                            // If we're here, we've most likely ran into a scenario like this:
+                            // ```lua
+                            // local x
+                            // if false then x = 10 else x = 20 end
+                            // return x
+                            // ```
+                            // When this happens we end up encountering a variable for the first
+                            // time in a scope it isn't allowed to be defined in (since the return
+                            // can't access it if it's defined in one of the if's blocks.
+                            //
+                            // Our solution to this is to find the last common ancestor shared by
+                            // all blocks the variable is used in and assume it was defined in that
+                            // block instead.
+                            //
+                            // TODO: ExtOpCode::DefineReg
+                            // We'll later probably want to inject a custom instruction that only
+                            // serves to mark an explicit write of `nil` to a register when we run
+                            // into cases like this. When we later emit source we'll then be able
+                            // to use that marker to create but not initialize the var, but for now
+                            // we'll leave that plan for the future.
+
+                            log::error!("abandoning merge!: {:#?} v {:#?}", n1, n2);
+                            used_vars.insert(n1.id, n1);
+                            used_vars.insert(n2.id, n2);
+                            continue;
+                        },
+                    };
+
+                    while let Some(&root) = merged.get(&root_id) {
+                        root_id = root;
+                    }
+
+                    log::debug!("merging {} and {} into {}", n1.id, n2.id, root_id);
+
+                    match () {
+                        () if n1.id == root_id => {
+                            merged.insert(n2.id, n1.id);
+                            n1.merge(n2);
+                            used_vars.insert(n1.id, n1);
+                        },
+                        () if n2.id == root_id => {
+                            merged.insert(n1.id, n2.id);
+                            n2.merge(n1);
+                            used_vars.insert(n2.id, n2);
+                        },
+                        () => {
+                            let root = used_vars.get_mut(&root_id).expect("can't find root var");
+
+                            merged.insert(n2.id, root.id);
+                            merged.insert(n1.id, root.id);
+
+                            root.merge(n1);
+                            root.merge(n2);
+                        },
+                    }
+                },
+            }
         }
 
         Some(used_vars.into_values().collect::<Vec<_>>())
@@ -385,6 +552,11 @@ impl LiftedFunction {
         for (block_id, origins) in block_to_origin {
             // If the block only has one origin
             if let [mut origin_id] = *origins {
+                // If we're considering merging into FunctionEntry, don't do it
+                if origin_id == LiftedBlockId(InstructionRef::FunctionEntry) {
+                    continue;
+                }
+
                 // Remap the origin if it has been remapped
                 while let Some(&remapped_id) = remapped.get(&origin_id) {
                     origin_id = remapped_id;
@@ -553,7 +725,7 @@ impl LiftedBlock {
     pub fn optimize(&mut self, protos: &[LiftedFunction]) -> usize {
         self.opt_custom_opcodes(protos)
             + self.opt_eliminate_oneshot_variables()
-            + self.opt_eliminate_duplicate_forks()
+            + self.opt_eliminate_identical_forks()
             + self.opt_eliminate_nop()
     }
 
@@ -620,7 +792,7 @@ impl LiftedBlock {
         len - self.instructions.len()
     }
 
-    fn opt_eliminate_duplicate_forks(&mut self) -> usize {
+    fn opt_eliminate_identical_forks(&mut self) -> usize {
         let len = self.forks_to.len();
         self.forks_to.dedup();
         len - self.forks_to.len()
@@ -696,14 +868,6 @@ fn lifetime_analysis(instructions: &[OpCode]) -> Option<LifetimeBlock> {
     let mut used_open = HashMap::<ArgSlot, (Option<usize>, Vec<usize>)>::new();
 
     for (idx, instr) in instructions.iter().enumerate() {
-        // If we run into any of these instructions, surrender completely for now
-        #[allow(clippy::single_match)]
-        match instr {
-            OpCode::Closure(_, _) => return None,
-            OpCode::Close(_) => return None,
-            _ => {},
-        }
-
         for Arg(_, slot) in instr.args_used().into_iter() {
             used_open.entry(slot).or_default().1.push(idx);
         }

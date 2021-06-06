@@ -39,6 +39,7 @@ pub trait OpInfo {
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub enum ExtOpCode {
+    DefineReg(ArgSlot),
     Closure(Arg, Arg, Vec<Arg>),
     Comment(String),
     Nop,
@@ -60,6 +61,9 @@ impl OpInfo for ExtOpCode {
     fn text_with(&self, text: impl Fn(&Arg) -> String) -> String {
         match self {
             ExtOpCode::Nop => String::new(),
+            &ExtOpCode::DefineReg(slot) => {
+                format!("local {0}", text(&Arg::write(slot)))
+            },
             ExtOpCode::Comment(str) => format!("--[[ {} ]]", str),
             ExtOpCode::Closure(into, cidx, args) => {
                 let args = args.iter().map(|x| text(x)).join(",");
@@ -68,9 +72,15 @@ impl OpInfo for ExtOpCode {
         }
     }
 
+    fn next(&self, addr: usize) -> Vec<InstructionRef> {
+        let skip = |off: i32| InstructionRef::Instruction((addr as i32 + off + 1) as usize);
+        vec![skip(0)]
+    }
+
     fn args_in(&self) -> Vec<Arg> {
         match self {
             ExtOpCode::Nop => vec![],
+            ExtOpCode::DefineReg(_) => vec![],
             ExtOpCode::Comment(_) => vec![],
             ExtOpCode::Closure(_, cidx, args) => {
                 let mut args = args.clone();
@@ -85,6 +95,7 @@ impl OpInfo for ExtOpCode {
             ExtOpCode::Closure(_, _, _) => vec![],
             ExtOpCode::Comment(_) => vec![],
             ExtOpCode::Nop => vec![],
+            ExtOpCode::DefineReg(_) => vec![],
         }
     }
 
@@ -93,12 +104,8 @@ impl OpInfo for ExtOpCode {
             ExtOpCode::Nop => vec![],
             ExtOpCode::Comment(_) => vec![],
             &ExtOpCode::Closure(into, _, _) => vec![into],
+            &ExtOpCode::DefineReg(reg) => vec![Arg::write(reg)],
         }
-    }
-
-    fn next(&self, addr: usize) -> Vec<InstructionRef> {
-        let skip = |off: i32| InstructionRef::Instruction((addr as i32 + off + 1) as usize);
-        vec![skip(0)]
     }
 }
 
@@ -175,9 +182,9 @@ impl OpInfo for OpCode {
             },
             &OpCode::This(Arg(_, ArgSlot::Register(a)), Arg(_, ArgSlot::Register(b)), c) => {
                 format!(
-                    "{}, {} = {b}, {b}[{c}]",
-                    text(&Arg(ArgDir::Write, ArgSlot::Register(a + 1))),
+                    "{}, {} = {b}[{c}], {b}",
                     text(&Arg(ArgDir::Write, ArgSlot::Register(a))),
+                    text(&Arg(ArgDir::Write, ArgSlot::Register(a + 1))),
                     b = text(&Arg(ArgDir::Read, ArgSlot::Register(b))),
                     c = text(&c),
                 )
@@ -214,18 +221,18 @@ impl OpInfo for OpCode {
                 Arg(_, ArgSlot::Value(b)),
                 Arg(_, ArgSlot::Value(c)),
             ) => {
-                let reg_ret = match c {
-                    0 => vec![Arg(ArgDir::Write, ArgSlot::Top)],
-                    1 => vec![],
-                    c => (a..=a + c - 2).map(ArgSlot::Register).map(Arg::write).collect::<Vec<_>>(),
-                };
-
                 let reg_arg = match b {
-                    0 => vec![Arg(ArgDir::Read, ArgSlot::Top)],
+                    0 => vec![Arg::read(ArgSlot::Top)],
                     _ => (a + 1..=a + b - 1)
                         .map(ArgSlot::Register)
                         .map(Arg::read)
                         .collect::<Vec<_>>(),
+                };
+
+                let reg_ret = match c {
+                    0 => vec![Arg(ArgDir::Write, ArgSlot::Top)],
+                    1 => vec![],
+                    c => (a..=a + c - 2).map(ArgSlot::Register).map(Arg::write).collect::<Vec<_>>(),
                 };
 
                 let reg_ret = reg_ret.iter().map(&text).join(", ");
@@ -243,7 +250,7 @@ impl OpInfo for OpCode {
                     0 => vec![Arg::write(ArgSlot::Top)],
                     _ => (a + 1..=a + b - 1)
                         .map(ArgSlot::Register)
-                        .map(Arg::write)
+                        .map(Arg::read)
                         .collect::<Vec<_>>(),
                 };
 
@@ -368,8 +375,8 @@ impl OpInfo for OpCode {
             &OpCode::Test(a, b) => vec![a, b],
             &OpCode::TestSet(a, b, c) => vec![a, b, c],
             &OpCode::Call(ArgSlot::Register(a), Arg(_, ArgSlot::Value(b)), _) => match b {
-                0 => vec![Arg::read(ArgSlot::Top)],
-                1 => vec![],
+                0 => vec![Arg::read(ArgSlot::Register(a)), Arg::read(ArgSlot::Top)],
+                1 => vec![Arg::read(ArgSlot::Register(a))],
                 b => (a..=a + b - 1).map(ArgSlot::Register).map(Arg::read).collect(),
             },
             &OpCode::TailCall(ArgSlot::Register(a), Arg(_, ArgSlot::Value(b))) => {
@@ -392,8 +399,9 @@ impl OpInfo for OpCode {
                 (a..=a + b).map(ArgSlot::Register).map(Arg::read).collect()
             },
             &OpCode::Vararg(_, _) => vec![],
-            opc @ OpCode::Close(_) => panic!("OpCode::Close unsupported: {:?}", opc),
-            opc @ OpCode::Closure(_, _) => panic!("OpCode::Closure unsupported: {:?}", opc),
+            &OpCode::Closure(_, b) => vec![b],
+            // TODO: Make sure this is correct.
+            OpCode::Close(_) => vec![],
             OpCode::Custom(c) => c.args_in(),
             opc => panic!("undefined opcode: {:?}", opc),
         }
@@ -454,9 +462,10 @@ impl OpInfo for OpCode {
             &OpCode::Vararg(ArgSlot::Register(a), Arg(_, ArgSlot::Value(b))) => {
                 (a..a + b - 1).map(ArgSlot::Register).map(Arg::write).collect()
             },
+            // TODO: Make sure this is correct.
+            &OpCode::Close(_) => vec![],
             &OpCode::Closure(a, _) => vec![a],
             OpCode::Custom(c) => c.args_out(),
-            opc @ OpCode::Close(_) => panic!("OpCode::Close unsupported: {:?}", opc),
             opc => panic!("undefined opcode: {:?}", opc),
         }
     }

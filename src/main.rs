@@ -11,7 +11,6 @@ use itertools::Itertools;
 use crate::{
     lifted::LiftedFunction,
     parsed::{Arg, ArgDir, ArgSlot, OpInfo},
-    raw::LuaFile,
 };
 
 mod lifted;
@@ -211,7 +210,7 @@ fn output_lifted_vars(
             },
         };
 
-        dbg!(&vars);
+        // dbg!(&vars);
 
         let blocks = func.blocks;
         let first_block = blocks.first_key_value().map(|(id, _)| *id);
@@ -344,7 +343,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut cursor = Cursor::new(buffer);
 
     log::info!("reading LuaFile");
-    let chunk = LuaFile::read(&mut cursor)?;
+    let chunk = raw::LuaFile::read(&mut cursor)?;
 
     log::info!("parsing top level function");
     let top = parsed::Function::parse(&chunk.top_level_func);
@@ -362,7 +361,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gv3 = output_lifted_vars(top.clone())?;
 
     log::info!("finished - waiting for graphviz/dot");
-    for mut proc in [gv1, gv2, gv3] {
+    for mut proc in IntoIterator::into_iter([gv1, gv2, gv3]) {
         proc.wait()?;
     }
 
