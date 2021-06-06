@@ -13,6 +13,7 @@ pub mod stage_2;
 pub mod stage_3;
 mod util;
 
+/// This is a terrible `escape` function, but it's good enough for our generated dot output.
 fn escape(s: String) -> String {
     s.replace('\\', "\\\\")
         .replace('\n', r"\n")
@@ -25,6 +26,7 @@ fn escape(s: String) -> String {
         .replace(r"\\l", r"\l")
 }
 
+/// Example function that runs the first stage and outputs some trace info.
 fn output_stage_1(top: stage_2::Function) {
     let mut stack = vec![top.clone()];
     while let Some(func) = stack.pop() {
@@ -39,6 +41,7 @@ fn output_stage_1(top: stage_2::Function) {
     }
 }
 
+/// Example function that runs the second stage and outputs a graph.
 fn output_stage_2(
     top: stage_2::Function,
 ) -> Result<std::process::Child, Box<dyn std::error::Error>> {
@@ -91,6 +94,7 @@ fn output_stage_2(
     Ok(std::process::Command::new("dot").arg("output.dot").arg("-O").arg("-Tsvg").spawn()?)
 }
 
+/// Example function that runs the third stage and outputs a graph.
 fn output_stage_3(
     top: stage_2::Function,
 ) -> Result<std::process::Child, Box<dyn std::error::Error>> {
@@ -178,6 +182,7 @@ fn output_stage_3(
     Ok(std::process::Command::new("dot").arg("output_lifted.dot").arg("-O").arg("-Tsvg").spawn()?)
 }
 
+/// Example function that runs the third stage, tries to recreate variables, then outputs a graph.
 fn output_stage_3_vars(
     top: stage_2::Function,
 ) -> Result<std::process::Child, Box<dyn std::error::Error>> {
@@ -209,8 +214,6 @@ fn output_stage_3_vars(
             },
         };
 
-        // dbg!(&vars);
-
         let blocks = func.blocks;
         let first_block = blocks.first_key_value().map(|(id, _)| *id);
 
@@ -229,19 +232,19 @@ fn output_stage_3_vars(
                 for var in vars.iter() {
                     let current = (block_id, idx);
 
-                    // Created this block
+                    // Created this block.
                     if var.origin == current {
                         var_names.insert(Arg::write(var.arg), format!("var_{}", var.id));
                     }
 
-                    // Used by this block
-                    for &location in var.uses.iter() {
+                    // Used by this block.
+                    for &location in var.reads.iter() {
                         if location == current {
                             var_names.insert(Arg::read(var.arg), format!("var_{}", var.id));
                         }
                     }
 
-                    // Modified by this block
+                    // Modified by this block.
                     for &location in var.mods.iter() {
                         if location == current {
                             var_names.insert(Arg::modify(var.arg), format!("var_{}", var.id));

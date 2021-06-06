@@ -1,4 +1,5 @@
-use std::collections::{hash_map, HashMap, HashSet};
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 
 use itertools::Itertools;
 use shrinkwraprs::Shrinkwrap;
@@ -7,30 +8,33 @@ use crate::util::IgnoreDebug;
 use crate::{stage_1 as s1, stage_3 as s3};
 
 pub trait OpInfo {
+    /// Generate a human-readable string for this OpCode, resolving basic `Arg` uses for constants.
     fn text(&self, constants: &[s3::Constant]) -> String {
         let text = |a: &Arg| a.text(constants);
         self.text_with(text)
     }
+    /// Generate a human-readable string for this OpCode, resolving args through the function
+    /// passed in `arg_to_string`.
     fn text_with(&self, arg_to_string: impl Fn(&Arg) -> String) -> String;
     fn next(&self, addr: usize) -> Vec<InstructionRef>;
 
-    // Arguments that are strictly input
+    /// Arguments that are strictly input.
     fn args_in(&self) -> Vec<Arg>;
 
-    // Arguments that are in-place modified
+    /// Arguments that are in-place modified.
     fn args_inout(&self) -> Vec<Arg>;
 
-    // Arguments that are strictly output
+    /// Arguments that are strictly output.
     fn args_out(&self) -> Vec<Arg>;
 
-    // Arguments that are used (in and inout, out aren't used but created)
-    fn args_used(&self) -> Vec<Arg> {
+    /// Arguments that are read (in and inout).
+    fn args_read(&self) -> Vec<Arg> {
         let mut x = self.args_in();
         x.extend(self.args_inout());
         x
     }
 
-    // Arguments that are written to (inout and out)
+    /// Arguments that are written to (inout and out).
     fn args_written(&self) -> Vec<Arg> {
         let mut x = self.args_inout();
         x.extend(self.args_out());
@@ -38,6 +42,7 @@ pub trait OpInfo {
     }
 }
 
+/// Custom operations, used for either adding metadata or simplifying existing opcodes.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub enum ExtOpCode {
     DefineReg(ArgSlot),
@@ -47,6 +52,7 @@ pub enum ExtOpCode {
 }
 
 impl ExtOpCode {
+    /// Convenience function to create an `ExtOpCode::Comment` from anything `String`-able.
     pub fn comment(str: impl Into<String>) -> ExtOpCode { ExtOpCode::Comment(str.into()) }
 }
 
@@ -526,8 +532,11 @@ impl Arg {
 }
 
 impl ArgSlot {
+    /// Returns whether the argument is a register.
+    /// Takes self by reference mainly to allow `.map(ArgSlot::is_reg)` and similar actions.
     pub fn is_reg(&self) -> bool { matches!(self, ArgSlot::Register(_)) }
 
+    /// Return a human-readable string to be used when printing this ArgSlot.
     pub fn text(&self, consts: &[s3::Constant]) -> String {
         match self {
             ArgSlot::Constant(x) => match consts.get(x.0 as usize) {
@@ -559,12 +568,15 @@ impl<'a> std::fmt::Display for ArgSlot {
 }
 
 impl<'a> ArgSlot {
+    /// Convenience function to create an `ArgSlot::Constant`.
     pub fn constant(index: u32) -> ArgSlot { ArgSlot::Constant(ConstantId(index)) }
 
-    pub fn const_or_reg(index: u32) -> ArgSlot {
-        match index & (1 << 8) {
-            0 => ArgSlot::Register(index & 0xFF),
-            _ => ArgSlot::constant(index & 0xFF),
+    /// Convenience function to create an `ArgSlot::Constant` or `ArgSlot::Register` from raw arg
+    /// data, depending on which of the two the raw data marks it as.
+    pub fn const_or_reg(raw: u32) -> ArgSlot {
+        match raw & (1 << 8) {
+            0 => ArgSlot::Register(raw & 0xFF),
+            _ => ArgSlot::constant(raw & 0xFF),
         }
     }
 }
@@ -587,7 +599,9 @@ impl std::fmt::Display for InstructionRef {
 }
 
 impl InstructionRef {
-    pub fn is_instruction_idx(&self) -> bool { matches!(self, InstructionRef::Instruction(_)) }
+    /// Returns if the reference is a "real" instruction, meaning a reference that isn't one of the
+    /// two pseudo-refs (`InstructionRef::FunctionEntry` and `InstructionRef::FunctionExit`).
+    pub fn is_instruction(&self) -> bool { matches!(self, InstructionRef::Instruction(_)) }
 }
 
 #[derive(Clone, Debug)]
@@ -780,7 +794,9 @@ pub struct Function<'a> {
 }
 
 impl<'a> Function<'a> {
+    /// Parse a raw `LuaFunction`
     pub fn parse(raw: &'a s1::LuaFunction) -> Function {
+        // Collect all raw instructions and parse them into their stage_2 representation
         let mut instructions = raw
             .instructions
             .0
@@ -789,6 +805,9 @@ impl<'a> Function<'a> {
             .map(|(index, i)| Instruction::parse(&raw, i, index))
             .collect::<Vec<_>>();
 
+        // Keep track of all jumps. They're almost always just "go to next instruction" but we're
+        // storing source and destination for all instructions anyway, if nothing else to easier
+        // represent the lack of a jump (for example `OpCode::Return`).
         let mut jumps: HashMap<InstructionRef, Vec<InstructionRef>> = HashMap::default();
 
         log::trace!("|instructions");
@@ -808,50 +827,66 @@ impl<'a> Function<'a> {
             }
         }
 
+        // Add the function's entrypoint as possible source for the first instruction.
+        // This matters mostly because a program that loops back to its entrypoint would otherwise
+        // see that there's only one way to the entrypoint and optimize accordingly, while in
+        // reality that's not strictly true.
         if let Some(instr) = instructions.get_mut(0) {
             instr.src.push(InstructionRef::FunctionEntry);
         }
 
+        // Collect prototypes and constants for later use.
         let prototypes = raw.prototypes.0.iter().map(Function::parse).collect();
         let constants = raw.constants.0.iter().collect();
 
         Function { raw, prototypes, instructions, constants }
     }
 
+    /// Get an instruction by its reference.
     pub fn instruction_at(&self, address: InstructionRef) -> Option<&Instruction<'a>> {
         self.instructions.iter().find(|x| x.addr == address)
     }
 
+    /// Get a vector of references to an instruction's source instruction(s).
     pub fn get_src(&self, instr: &Instruction<'a>) -> Vec<&Instruction<'a>> {
         instr
             .src
             .iter()
             .copied()
-            .filter(InstructionRef::is_instruction_idx)
+            .filter(InstructionRef::is_instruction)
             .map(|addr| self.instruction_at(addr).unwrap())
             .collect()
     }
 
+    /// Get a vector of references to an instruction's destination instruction(s).
     pub fn get_dst(&self, instr: &Instruction<'a>) -> Vec<&Instruction<'a>> {
         instr
             .dst
             .iter()
             .copied()
-            .filter(InstructionRef::is_instruction_idx)
+            .filter(InstructionRef::is_instruction)
             .map(|addr| self.instruction_at(addr).unwrap())
             .collect()
     }
 
-    // Whether or not a function has a "basic" control flow, meaning it only comes from one source
-    // and only jumps to one destination
+    /// Returns whether or not an instruction has a "basic" control flow.
+    /// Basic in this case is defined as an instruction that can only reached from one other
+    /// instruction, and only has one possible next instruction.
     pub fn is_basic_cf(&self, instr: &Instruction<'a>) -> bool {
         self.has_basic_src(instr) && self.has_basic_dst(instr)
     }
 
+    /// Returns whether or not an instruction has a "basic" source.
+    /// Basic in this case is defined as an instruction that can only reached from one other
+    /// instruction.
     pub fn has_basic_src(&self, instr: &Instruction<'a>) -> bool { self.get_src(&instr).len() == 1 }
 
+    /// Returns whether or not an instruction has a "basic" destination.
+    /// Basic in this case is defined as an instruction that can only jump to one other
+    /// instruction.
     pub fn has_basic_dst(&self, instr: &Instruction<'a>) -> bool { self.get_dst(instr).len() == 1 }
 
+    /// Returns an instruction's "basic" destination, or none if it does not have one.
     pub fn basic_dst(&self, instr: &Instruction<'a>) -> Option<&Instruction<'a>> {
         match *self.get_dst(&instr) {
             [dst] => Some(dst),
@@ -859,27 +894,43 @@ impl<'a> Function<'a> {
         }
     }
 
+    /// Creates a vector of "blocks", chains of instructions that can only be reached from the
+    /// start of the chain and can only exit at the end of the chain. The definition of exit in
+    /// this case does not include things like function calls, since they eventually return and
+    /// continue executing the chain.
     pub fn blocks(&self) -> HashMap<InstructionRef, Block<'_, 'a>> {
         let mut blocks = HashMap::default();
+
+        // Start off analysis with the function's first instruction on the stack, or if there isn't
+        // a first instruction, just return an empty hashmap already. A function with no
+        // instructions will also not have any blocks.
         let mut trails = vec![match self.instructions.get(0) {
             Some(i) => i,
             None => return HashMap::default(),
         }];
 
+        // Iterate all instructions, generating blocks from them.
+        // Each loop in this `while` statement generates one block, or zero if the instruction at
+        // the top of the stack had already been visited and analyzed before.
         let mut seen = HashSet::new();
         while let Some(mut instr) = trails.pop() {
+            // If we've seen this exact instruction before, ignore it.
+            // This happens when we run into loops, since the last instruction will reference the
+            // first instruction as a possible jump destination, re-entering it into the queue.
             if !seen.insert(instr.addr) {
                 continue;
             }
 
             let entry = match blocks.entry(instr.addr) {
-                hash_map::Entry::Occupied(_) => continue,
-                hash_map::Entry::Vacant(x) => x,
+                Entry::Occupied(_) => continue,
+                Entry::Vacant(x) => x,
             };
 
+            // Back up the start address here, since we're about to get rid of this reference.
             let start_addr = instr.addr;
-            let mut instructions = vec![];
 
+            // Iterate instructions until we hit one that has a non-basic source or destination.
+            let mut instructions = vec![];
             while let Some(next) = self.basic_dst(instr) {
                 if self.has_basic_src(next) {
                     instructions.push(instr);
@@ -889,10 +940,13 @@ impl<'a> Function<'a> {
                 }
             }
 
+            // Push the instruction we were about to read, since it's not yet pushed.
             instructions.push(instr);
 
+            // Get all instructions that this instruction can fork to.
             let forks_to = self.get_dst(instr);
 
+            // Create a block from the data we've collected so far.
             entry.insert(Block {
                 function: self,
                 addr_start: start_addr,
@@ -901,6 +955,7 @@ impl<'a> Function<'a> {
                 forks_to: forks_to.clone(),
             });
 
+            // And finally, put all new-found trails into the queue to analyze them too.
             trails.extend(forks_to);
         }
 
