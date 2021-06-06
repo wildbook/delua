@@ -2,13 +2,13 @@ use shrinkwraprs::Shrinkwrap;
 use std::collections::{btree_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::{
-    stage_1,
-    stage_2::{self, OpInfo},
+    stage_1 as s1,
+    stage_2::{self as s2, OpInfo},
     util::discard,
 };
 
 #[derive(Shrinkwrap, Debug, Eq, PartialEq, Clone, Copy, PartialOrd, Ord, Hash)]
-pub struct BlockId(pub stage_2::InstructionRef);
+pub struct BlockId(pub s2::InstructionRef);
 
 #[derive(Debug)]
 pub struct Function {
@@ -18,7 +18,7 @@ pub struct Function {
     pub constants: Vec<Constant>,
     pub count_upvals: u8,
     pub count_args: u8,
-    pub used_slots: HashSet<stage_2::ArgSlot>,
+    pub used_slots: HashSet<s2::ArgSlot>,
 }
 
 #[derive(Shrinkwrap, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -39,11 +39,11 @@ pub struct Variable {
     pub uses: HashSet<(BlockId, usize)>,
     pub mods: HashSet<(BlockId, usize)>,
 
-    pub arg: stage_2::ArgSlot,
+    pub arg: s2::ArgSlot,
 }
 
 impl Variable {
-    pub fn new(id: VariableId, origin: (BlockId, usize), arg: stage_2::ArgSlot) -> Variable {
+    pub fn new(id: VariableId, origin: (BlockId, usize), arg: s2::ArgSlot) -> Variable {
         Variable {
             id,
             origin,
@@ -108,7 +108,7 @@ impl Variable {
 }
 
 impl Function {
-    pub fn lift(p: stage_2::Function<'_>) -> Function {
+    pub fn lift(p: s2::Function<'_>) -> Function {
         // Generate and lift all blocks
         let mut blocks: BTreeMap<_, _> =
             p.blocks().into_iter().map(|(id, block)| (BlockId(id), Block::lift(block))).collect();
@@ -149,29 +149,27 @@ impl Function {
         // alternatives that I haven't thought of.
         if let Some((&first_block_id, _)) = blocks.first_key_value() {
             let mut regs =
-                slots.iter().copied().filter(stage_2::ArgSlot::is_reg).collect::<BTreeSet<_>>();
+                slots.iter().copied().filter(s2::ArgSlot::is_reg).collect::<BTreeSet<_>>();
 
-            let mut mark_opcs: Vec<stage_2::OpCode> = vec![];
+            let mut mark_opcs: Vec<s2::OpCode> = vec![];
 
             if p.raw.arg_count > 0 {
-                mark_opcs
-                    .push(stage_2::ExtOpCode::comment(format!("args: {}", p.raw.arg_count)).into());
+                mark_opcs.push(s2::ExtOpCode::comment(format!("args: {}", p.raw.arg_count)).into());
                 for reg in 0..p.raw.arg_count {
                     // We want to avoid shadowing any arguments
-                    regs.remove(&stage_2::ArgSlot::Register(reg as _));
+                    regs.remove(&s2::ArgSlot::Register(reg as _));
                 }
             }
 
             if !regs.is_empty() {
                 // TODO: Remove these comments once we start optimizing out ExtOpCode::DefineReg
-                mark_opcs.push(stage_2::ExtOpCode::comment("fallback defines").into());
-                mark_opcs
-                    .extend(regs.into_iter().map(stage_2::ExtOpCode::DefineReg).map(Into::into));
-                mark_opcs.push(stage_2::ExtOpCode::comment("fallback defines end").into());
+                mark_opcs.push(s2::ExtOpCode::comment("fallback defines").into());
+                mark_opcs.extend(regs.into_iter().map(s2::ExtOpCode::DefineReg).map(Into::into));
+                mark_opcs.push(s2::ExtOpCode::comment("fallback defines end").into());
             }
 
             blocks.insert(
-                BlockId(stage_2::InstructionRef::FunctionEntry),
+                BlockId(s2::InstructionRef::FunctionEntry),
                 Block { instructions: mark_opcs, forks_to: vec![first_block_id] },
             );
         }
@@ -210,16 +208,16 @@ impl Function {
             .map(|i| {
                 Variable::new(
                     new_var(),
-                    (BlockId(stage_2::InstructionRef::FunctionEntry), 0),
-                    stage_2::ArgSlot::Register(i as _),
+                    (BlockId(s2::InstructionRef::FunctionEntry), 0),
+                    s2::ArgSlot::Register(i as _),
                 )
             })
             .map(|x| (x.arg, x));
 
         let mut block_stack = vec![(
             *func.blocks.first_key_value().unwrap().0,
-            BlockId(stage_2::InstructionRef::FunctionEntry),
-            arguments.collect::<HashMap<stage_2::ArgSlot, Variable>>(),
+            BlockId(s2::InstructionRef::FunctionEntry),
+            arguments.collect::<HashMap<s2::ArgSlot, Variable>>(),
         )];
 
         let mut used_shut = vec![];
@@ -253,15 +251,15 @@ impl Function {
 
                 // If we run into any OpCode::Closure calls, surrender completely.
                 // Refer to the comment above.
-                if let stage_2::OpCode::Closure(_, _) = instr {
+                if let s2::OpCode::Closure(_, _) = instr {
                     log::warn!("unsupported instruction: {}", instr.text(consts));
                     return None;
                 }
 
                 for arg in instr.args_used().into_iter().filter(|x| x.slot().is_reg()) {
                     match (arg.dir(), live_vars.get_mut(&arg)) {
-                        (stage_2::ArgDir::Read, Some(x)) => x.add_use(block_id, idx),
-                        (stage_2::ArgDir::Modify, Some(x)) => x.add_mod(block_id, idx),
+                        (s2::ArgDir::Read, Some(x)) => x.add_use(block_id, idx),
+                        (s2::ArgDir::Modify, Some(x)) => x.add_mod(block_id, idx),
                         _ => {
                             log::warn!("reading unwritten {} {:?} ({})", arg, block_id, idx);
                             return None;
@@ -272,8 +270,8 @@ impl Function {
                 instr
                     .args_out()
                     .into_iter()
-                    .map(stage_2::Arg::slot)
-                    .filter(stage_2::ArgSlot::is_reg)
+                    .map(s2::Arg::slot)
+                    .filter(s2::ArgSlot::is_reg)
                     .for_each(|slot| {
                         let id = new_var();
                         let origin = (block_id, idx);
@@ -290,7 +288,7 @@ impl Function {
                         live_vars.insert(slot, var);
                     });
 
-                if let stage_2::OpCode::Return(_, _) = instr {
+                if let s2::OpCode::Return(_, _) = instr {
                     used_shut.extend(live_vars.drain().map(|(_, x)| x));
                 }
             }
@@ -312,10 +310,8 @@ impl Function {
         }
 
         let mut used_vars = used_shut_merged;
-        let mut usage_to_var: HashMap<
-            (stage_2::ArgDir, stage_2::ArgSlot, (BlockId, usize)),
-            VariableId,
-        > = HashMap::new();
+        let mut usage_to_var: HashMap<(s2::ArgDir, s2::ArgSlot, (BlockId, usize)), VariableId> =
+            HashMap::new();
 
         let mut collisions = HashMap::<VariableId, VariableId>::new();
 
@@ -331,14 +327,14 @@ impl Function {
                     .or_insert(var.id);
             };
 
-            register(stage_2::ArgDir::Write, var.origin);
+            register(s2::ArgDir::Write, var.origin);
 
             for origin in var.uses.iter().copied() {
-                register(stage_2::ArgDir::Read, origin);
+                register(s2::ArgDir::Read, origin);
             }
 
             for origin in var.mods.iter().copied() {
-                register(stage_2::ArgDir::Modify, origin);
+                register(s2::ArgDir::Modify, origin);
             }
         }
 
@@ -550,7 +546,7 @@ impl Function {
             // If the block only has one origin
             if let [mut origin_id] = *origins {
                 // If we're considering merging into FunctionEntry, don't do it
-                if origin_id == BlockId(stage_2::InstructionRef::FunctionEntry) {
+                if origin_id == BlockId(s2::InstructionRef::FunctionEntry) {
                     continue;
                 }
 
@@ -601,13 +597,12 @@ impl Function {
                 };
 
                 let (dst, idx) = match block.instructions[created] {
-                    stage_2::OpCode::Closure(
+                    s2::OpCode::Closure(dst, s2::Arg(_, s2::ArgSlot::FnConstant(idx))) => {
+                        (dst, idx)
+                    },
+                    s2::OpCode::Custom(s2::ExtOpCode::Closure(
                         dst,
-                        stage_2::Arg(_, stage_2::ArgSlot::FnConstant(idx)),
-                    ) => (dst, idx),
-                    stage_2::OpCode::Custom(stage_2::ExtOpCode::Closure(
-                        dst,
-                        stage_2::Arg(_, stage_2::ArgSlot::FnConstant(idx)),
+                        s2::Arg(_, s2::ArgSlot::FnConstant(idx)),
                         _,
                     )) => (dst, idx),
                     _ => continue,
@@ -615,10 +610,9 @@ impl Function {
 
                 for used in var.uses {
                     match block.instructions[used] {
-                        stage_2::OpCode::SetGlobal(
-                            src,
-                            stage_2::Arg(_, stage_2::ArgSlot::Constant(g)),
-                        ) if src == dst => {
+                        s2::OpCode::SetGlobal(src, s2::Arg(_, s2::ArgSlot::Constant(g)))
+                            if src == dst =>
+                        {
                             match (
                                 self.children.get_mut(idx as usize),
                                 self.constants.get(g.0 as usize),
@@ -633,7 +627,7 @@ impl Function {
                                 },
                                 _ => continue,
                             }
-                        },
+                        }
                         _ => continue,
                     }
                 }
@@ -653,12 +647,12 @@ pub enum Constant {
 }
 
 impl Constant {
-    pub fn lift(p: &stage_1::LuaConstant) -> Constant {
+    pub fn lift(p: &s1::LuaConstant) -> Constant {
         match p {
-            stage_1::LuaConstant::Nil => Constant::Nil,
-            &stage_1::LuaConstant::Bool(x) => Constant::Bool(x),
-            stage_1::LuaConstant::Number(x) => Constant::Number(x.0),
-            stage_1::LuaConstant::String(x) => Constant::String(x.to_string()),
+            s1::LuaConstant::Nil => Constant::Nil,
+            &s1::LuaConstant::Bool(x) => Constant::Bool(x),
+            s1::LuaConstant::Number(x) => Constant::Number(x.0),
+            s1::LuaConstant::String(x) => Constant::String(x.to_string()),
         }
         //
     }
@@ -677,7 +671,7 @@ impl std::fmt::Display for Constant {
 
 #[derive(Debug, Hash, PartialEq, Eq)]
 pub struct LifetimeVariable {
-    pub arg: stage_2::ArgSlot,
+    pub arg: s2::ArgSlot,
     pub created: Option<usize>,
     pub deleted: Option<usize>,
     pub uses: Vec<usize>,
@@ -685,19 +679,19 @@ pub struct LifetimeVariable {
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct LifetimeBlock {
-    pub imported: HashSet<stage_2::ArgSlot>,
-    pub exported: HashSet<stage_2::ArgSlot>,
+    pub imported: HashSet<s2::ArgSlot>,
+    pub exported: HashSet<s2::ArgSlot>,
     pub vars: Vec<LifetimeVariable>,
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct Block {
-    pub instructions: Vec<stage_2::OpCode>,
+    pub instructions: Vec<s2::OpCode>,
     pub forks_to: Vec<BlockId>,
 }
 
 impl Block {
-    pub fn lift(p: stage_2::Block<'_, '_>) -> Block {
+    pub fn lift(p: s2::Block<'_, '_>) -> Block {
         let instructions = p.instructions.into_iter().map(|x| x.op_code.clone()).collect();
         let forks_to = p.forks_to.into_iter().map(|i| BlockId(i.addr)).collect();
 
@@ -713,11 +707,11 @@ impl Block {
         self.forks_to = block.forks_to;
     }
 
-    pub fn push_front(&mut self, i: impl IntoIterator<Item = impl Into<stage_2::OpCode>>) {
+    pub fn push_front(&mut self, i: impl IntoIterator<Item = impl Into<s2::OpCode>>) {
         self.instructions.splice(0..0, i.into_iter().map(Into::into));
     }
 
-    pub fn push_back(&mut self, i: impl IntoIterator<Item = impl Into<stage_2::OpCode>>) {
+    pub fn push_back(&mut self, i: impl IntoIterator<Item = impl Into<s2::OpCode>>) {
         self.instructions.extend(i.into_iter().map(Into::into));
     }
 }
@@ -739,28 +733,25 @@ impl Block {
         while let Some(instr) = drain.next() {
             match instr {
                 // Rewrite OpCode::Closure and the slot allocations following it into our own equivalent
-                stage_2::OpCode::Closure(
-                    dest,
-                    stage_2::Arg(dir, stage_2::ArgSlot::FnConstant(cidx)),
-                ) => {
+                s2::OpCode::Closure(dest, s2::Arg(dir, s2::ArgSlot::FnConstant(cidx))) => {
                     let upvc = protos[cidx as usize].count_upvals.into();
                     let mut upvs = vec![];
 
                     for _ in 0..upvc {
                         match drain.next() {
-                            Some(stage_2::OpCode::Move(_, src)) => upvs.push(src),
-                            Some(stage_2::OpCode::GetUpVal(_, src)) => upvs.push(src),
+                            Some(s2::OpCode::Move(_, src)) => upvs.push(src),
+                            Some(s2::OpCode::GetUpVal(_, src)) => upvs.push(src),
                             None => panic!("ran out of instructions while constructing closure"),
                             _ => panic!("unexpected instruction while constructing closure"),
                         }
                     }
 
-                    let op = stage_2::ExtOpCode::Closure(
+                    let op = s2::ExtOpCode::Closure(
                         dest,
-                        stage_2::Arg(dir, stage_2::ArgSlot::FnConstant(cidx)),
+                        s2::Arg(dir, s2::ArgSlot::FnConstant(cidx)),
                         upvs,
                     );
-                    instructions.push(stage_2::OpCode::Custom(op));
+                    instructions.push(s2::OpCode::Custom(op));
 
                     score += 1;
                 },
@@ -786,10 +777,10 @@ impl Block {
         // Only retain opcodes that aren't ONLY branching
         #[allow(clippy::match_like_matches_macro)]
         self.instructions.retain(|op_code| match op_code {
-            stage_2::OpCode::Jmp(_) => false,
-            stage_2::OpCode::LessThan(_, _, _) => false,
-            stage_2::OpCode::Equals(_, _, _) => false,
-            stage_2::OpCode::Custom(stage_2::ExtOpCode::Nop) => false,
+            s2::OpCode::Jmp(_) => false,
+            s2::OpCode::LessThan(_, _, _) => false,
+            s2::OpCode::Equals(_, _, _) => false,
+            s2::OpCode::Custom(s2::ExtOpCode::Nop) => false,
             _ => true,
         });
 
@@ -827,54 +818,40 @@ impl Block {
                 log::trace!("only used once: {} ({} -> {})", arg, created, uses[0]);
 
                 let (solo_arg, used_arg) = match self.instructions.get(created) {
-                    Some(&stage_2::OpCode::GetGlobal(
-                        stage_2::Arg(_, dst),
-                        stage_2::Arg(_, stage_2::ArgSlot::Constant(cid)),
-                    )) => (dst, stage_2::ArgSlot::Global(cid)),
-                    Some(&stage_2::OpCode::LoadK(
-                        stage_2::Arg(_, dst @ stage_2::ArgSlot::Register(_)),
-                        stage_2::Arg(_, cid @ stage_2::ArgSlot::Constant(_)),
+                    Some(&s2::OpCode::GetGlobal(
+                        s2::Arg(_, dst),
+                        s2::Arg(_, s2::ArgSlot::Constant(cid)),
+                    )) => (dst, s2::ArgSlot::Global(cid)),
+                    Some(&s2::OpCode::LoadK(
+                        s2::Arg(_, dst @ s2::ArgSlot::Register(_)),
+                        s2::Arg(_, cid @ s2::ArgSlot::Constant(_)),
                     )) => (dst, cid),
                     _ => continue,
                 };
 
                 let swappable_args = match self.instructions.get_mut(used) {
-                    Some(stage_2::OpCode::SetGlobal(stage_2::Arg(_, src), _)) => vec![src],
-                    Some(stage_2::OpCode::GetTable(
-                        _,
-                        stage_2::Arg(_, tbl),
-                        stage_2::Arg(_, idx),
-                    )) => {
+                    Some(s2::OpCode::SetGlobal(s2::Arg(_, src), _)) => vec![src],
+                    Some(s2::OpCode::GetTable(_, s2::Arg(_, tbl), s2::Arg(_, idx))) => {
                         vec![tbl, idx]
                     },
-                    Some(stage_2::OpCode::SetTable(
-                        stage_2::Arg(_, tbl),
-                        stage_2::Arg(_, idx),
-                        stage_2::Arg(_, val),
+                    Some(s2::OpCode::SetTable(
+                        s2::Arg(_, tbl),
+                        s2::Arg(_, idx),
+                        s2::Arg(_, val),
                     )) => {
                         vec![tbl, idx, val]
                     },
-                    Some(stage_2::OpCode::SetUpVal(stage_2::Arg(_, val), _)) => vec![val],
+                    Some(s2::OpCode::SetUpVal(s2::Arg(_, val), _)) => vec![val],
                     // Comparisons
-                    Some(stage_2::OpCode::Equals(
-                        _,
-                        stage_2::Arg(_, lhs),
-                        stage_2::Arg(_, rhs),
-                    )) => {
+                    Some(s2::OpCode::Equals(_, s2::Arg(_, lhs), s2::Arg(_, rhs))) => {
                         vec![lhs, rhs]
                     },
-                    Some(stage_2::OpCode::LessThan(
-                        _,
-                        stage_2::Arg(_, lhs),
-                        stage_2::Arg(_, rhs),
-                    )) => {
+                    Some(s2::OpCode::LessThan(_, s2::Arg(_, lhs), s2::Arg(_, rhs))) => {
                         vec![lhs, rhs]
                     },
-                    Some(stage_2::OpCode::LessThanOrEquals(
-                        _,
-                        stage_2::Arg(_, lhs),
-                        stage_2::Arg(_, rhs),
-                    )) => vec![lhs, rhs],
+                    Some(s2::OpCode::LessThanOrEquals(_, s2::Arg(_, lhs), s2::Arg(_, rhs))) => {
+                        vec![lhs, rhs]
+                    },
                     _ => continue,
                 };
 
@@ -884,7 +861,7 @@ impl Block {
                     }
                 }
 
-                self.instructions[created] = stage_2::OpCode::Custom(stage_2::ExtOpCode::Nop);
+                self.instructions[created] = s2::OpCode::Custom(s2::ExtOpCode::Nop);
                 score += 1;
             }
         }
@@ -893,20 +870,20 @@ impl Block {
     }
 }
 
-fn lifetime_analysis(instructions: &[stage_2::OpCode]) -> Option<LifetimeBlock> {
+fn lifetime_analysis(instructions: &[s2::OpCode]) -> Option<LifetimeBlock> {
     let mut imported = HashSet::new();
     let mut exported = HashSet::new();
 
     // Vec<(Arg, from, Vec<uses>)
     let mut used_shut = vec![];
-    let mut used_open = HashMap::<stage_2::ArgSlot, (Option<usize>, Vec<usize>)>::new();
+    let mut used_open = HashMap::<s2::ArgSlot, (Option<usize>, Vec<usize>)>::new();
 
     for (idx, instr) in instructions.iter().enumerate() {
         for crate::Arg(_, slot) in instr.args_used().into_iter() {
             used_open.entry(slot).or_default().1.push(idx);
         }
 
-        for stage_2::Arg(_, slot) in instr.args_out() {
+        for s2::Arg(_, slot) in instr.args_out() {
             // Register a new create
             let old_use = used_open.insert(slot, (Some(idx), vec![]));
 
@@ -916,7 +893,7 @@ fn lifetime_analysis(instructions: &[stage_2::OpCode]) -> Option<LifetimeBlock> 
             };
         }
 
-        if let stage_2::OpCode::Return(_, _) = instr {
+        if let s2::OpCode::Return(_, _) = instr {
             for (arg, (from, uses)) in used_open.drain() {
                 used_shut.push((arg, from, Some(idx), uses))
             }

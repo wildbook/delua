@@ -3,10 +3,10 @@ use std::collections::{hash_map, HashMap, HashSet};
 use itertools::Itertools;
 use shrinkwraprs::Shrinkwrap;
 
-use crate::{stage_1, stage_3, util::IgnoreDebug};
+use crate::{stage_1 as s1, stage_3 as s3, util::IgnoreDebug};
 
 pub trait OpInfo {
-    fn text(&self, constants: &[stage_3::Constant]) -> String {
+    fn text(&self, constants: &[s3::Constant]) -> String {
         let text = |a: &Arg| a.text(constants);
         self.text_with(text)
     }
@@ -549,7 +549,7 @@ impl ArgSlot {
         matches!(self, ArgSlot::Register(_))
     }
 
-    pub fn text(&self, consts: &[stage_3::Constant]) -> String {
+    pub fn text(&self, consts: &[s3::Constant]) -> String {
         match self {
             ArgSlot::Constant(x) => match consts.get(x.0 as usize) {
                 Some(c) => format!("{}", c),
@@ -617,8 +617,8 @@ impl InstructionRef {
 
 #[derive(Clone, Debug)]
 pub struct Instruction<'a> {
-    raw: &'a stage_1::LuaInstruction,
-    fun: IgnoreDebug<&'a stage_1::LuaFunction>,
+    raw: &'a s1::LuaInstruction,
+    fun: IgnoreDebug<&'a s1::LuaFunction>,
 
     pub addr: InstructionRef,
     pub op_code: OpCode,
@@ -628,7 +628,7 @@ pub struct Instruction<'a> {
 }
 
 impl<'a> Instruction<'a> {
-    pub fn parse(f: &'a stage_1::LuaFunction, i: &'a stage_1::LuaInstruction, addr: usize) -> Self {
+    pub fn parse(f: &'a s1::LuaFunction, i: &'a s1::LuaInstruction, addr: usize) -> Self {
         let op_code = match i.op() {
             0 => OpCode::Move(
                 Arg::write(ArgSlot::Register(i.a())),
@@ -798,14 +798,14 @@ impl<'a> std::fmt::Display for Instruction<'a> {
 
 #[derive(Clone, Debug)]
 pub struct Function<'a> {
-    pub raw: &'a stage_1::LuaFunction,
+    pub raw: &'a s1::LuaFunction,
     pub prototypes: Vec<Function<'a>>,
     pub instructions: Vec<Instruction<'a>>,
-    pub constants: Vec<&'a stage_1::LuaConstant>,
+    pub constants: Vec<&'a s1::LuaConstant>,
 }
 
 impl<'a> Function<'a> {
-    pub fn parse(raw: &'a stage_1::LuaFunction) -> Function {
+    pub fn parse(raw: &'a s1::LuaFunction) -> Function {
         let mut instructions = raw
             .instructions
             .0
