@@ -26,8 +26,8 @@ fn escape(s: String) -> String {
         .replace(r"\\l", r"\l")
 }
 
-/// Example function that runs the first stage and outputs some trace info.
-fn output_stage_1(top: stage_2::Function) {
+/// Example function that takes a `stage_2::Function` and outputs some trace info.
+fn output_stage_2_trace(top: stage_2::Function) {
     let mut stack = vec![top.clone()];
     while let Some(func) = stack.pop() {
         let block = func.blocks();
@@ -41,8 +41,8 @@ fn output_stage_1(top: stage_2::Function) {
     }
 }
 
-/// Example function that runs the second stage and outputs a graph.
-fn output_stage_2(
+/// Example function that takes a `stage_2::Function` and outputs a graph.
+fn output_stage_2_graph(
     top: stage_2::Function,
 ) -> Result<std::process::Child, Box<dyn std::error::Error>> {
     let mut out = BufWriter::new(std::fs::File::create("output.dot")?);
@@ -94,8 +94,8 @@ fn output_stage_2(
     Ok(std::process::Command::new("dot").arg("output.dot").arg("-O").arg("-Tsvg").spawn()?)
 }
 
-/// Example function that runs the third stage and outputs a graph.
-fn output_stage_3(
+/// Example function that takes a `stage_3::Function` and outputs a graph.
+fn output_stage_3_graph(
     top: stage_2::Function,
 ) -> Result<std::process::Child, Box<dyn std::error::Error>> {
     let mut lifted = stage_3::Function::lift(top.clone()).with_name("Entrypoint");
@@ -182,8 +182,8 @@ fn output_stage_3(
     Ok(std::process::Command::new("dot").arg("output_lifted.dot").arg("-O").arg("-Tsvg").spawn()?)
 }
 
-/// Example function that runs the third stage, tries to recreate variables, then outputs a graph.
-fn output_stage_3_vars(
+/// Example function that takes a `stage_3::Function`, tries to recreate variables, then outputs a graph.
+fn output_stage_3_vars_graph(
     top: stage_2::Function,
 ) -> Result<std::process::Child, Box<dyn std::error::Error>> {
     let mut lifted = stage_3::Function::lift(top.clone()).with_name("Entrypoint");
@@ -232,19 +232,19 @@ fn output_stage_3_vars(
                 for var in vars.iter() {
                     let current = (block_id, idx);
 
-                    // Created this block.
+                    // Created by this instruction.
                     if var.origin == current {
                         var_names.insert(Arg::write(var.arg), format!("var_{}", var.id));
                     }
 
-                    // Used by this block.
+                    // Used by this instruction.
                     for &location in var.reads.iter() {
                         if location == current {
                             var_names.insert(Arg::read(var.arg), format!("var_{}", var.id));
                         }
                     }
 
-                    // Modified by this block.
+                    // Modified by this instruction.
                     for &location in var.mods.iter() {
                         if location == current {
                             var_names.insert(Arg::modify(var.arg), format!("var_{}", var.id));
@@ -345,22 +345,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut cursor = Cursor::new(buffer);
 
     log::info!("reading LuaFile");
-    let chunk = stage_1::LuaFile::read(&mut cursor)?;
+    let s1_file = stage_1::LuaFile::read(&mut cursor)?;
 
     log::info!("parsing top level function");
-    let top = stage_2::Function::parse(&chunk.top_level_func);
+    let s2_func = stage_2::Function::parse(&s1_file.top_level_func);
 
     log::info!("executing output_stage_1");
-    output_stage_1(top.clone());
+    output_stage_2_trace(s2_func.clone());
 
     log::info!("executing output_stage_2");
-    let gv1 = output_stage_2(top.clone())?;
+    let gv1 = output_stage_2_graph(s2_func.clone())?;
 
     log::info!("executing output_stage_3");
-    let gv2 = output_stage_3(top.clone())?;
+    let gv2 = output_stage_3_graph(s2_func.clone())?;
 
     log::info!("executing output_stage_3_vars");
-    let gv3 = output_stage_3_vars(top.clone())?;
+    let gv3 = output_stage_3_vars_graph(s2_func.clone())?;
 
     log::info!("finished - waiting for graphviz/dot");
     for mut proc in IntoIterator::into_iter([gv1, gv2, gv3]) {
