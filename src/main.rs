@@ -96,18 +96,15 @@ fn output_stage_2_graph(
 
 /// Example function that takes a `stage_3::Function` and outputs a graph.
 fn output_stage_3_graph(
-    top: stage_2::Function,
+    func: stage_3::Function,
 ) -> Result<std::process::Child, Box<dyn std::error::Error>> {
-    let mut lifted = stage_3::Function::lift(top.clone()).with_name("Entrypoint");
-    dbg!(lifted.optimize_until_complete());
-
     let mut out = BufWriter::new(std::fs::File::create("output_lifted.dot")?);
 
     writeln!(out, "digraph L {{")?;
     writeln!(out, "  graph [splines=ortho, packmode=\"cluster\"]")?;
     writeln!(out, "  node [shape=record fontname=Consolas style=filled color=white margin=0.2];")?;
     let mut fn_index = 0;
-    let mut stack_fn = vec![lifted];
+    let mut stack_fn = vec![func];
     while let Some(func) = stack_fn.pop() {
         writeln!(out, "subgraph cluster_fn_{} {{", fn_index)?;
         writeln!(out, "  fontname = Consolas")?;
@@ -184,18 +181,15 @@ fn output_stage_3_graph(
 
 /// Example function that takes a `stage_3::Function`, tries to recreate variables, then outputs a graph.
 fn output_stage_3_vars_graph(
-    top: stage_2::Function,
+    func: stage_3::Function,
 ) -> Result<std::process::Child, Box<dyn std::error::Error>> {
-    let mut lifted = stage_3::Function::lift(top.clone()).with_name("Entrypoint");
-    dbg!(lifted.optimize_until_complete());
-
     let mut out = BufWriter::new(std::fs::File::create("output_lifted_vars.dot")?);
 
     writeln!(out, "digraph L {{")?;
     writeln!(out, "  graph [splines=ortho, packmode=\"cluster\"]")?;
     writeln!(out, "  node [shape=record fontname=Consolas style=filled color=white margin=0.2];")?;
     let mut fn_index = 0;
-    let mut stack_fn = vec![lifted];
+    let mut stack_fn = vec![func];
     while let Some(func) = stack_fn.pop() {
         writeln!(out, "subgraph cluster_fn_{} {{", fn_index)?;
         writeln!(out, "  fontname = Consolas")?;
@@ -356,11 +350,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     log::info!("executing output_stage_2");
     let gv1 = output_stage_2_graph(s2_func.clone())?;
 
+    let mut s3_func = stage_3::Function::lift(s2_func.clone()).with_name("Entrypoint");
+    dbg!(s3_func.optimize_until_complete());
+
     log::info!("executing output_stage_3");
-    let gv2 = output_stage_3_graph(s2_func.clone())?;
+    let gv2 = output_stage_3_graph(s3_func.clone())?;
 
     log::info!("executing output_stage_3_vars");
-    let gv3 = output_stage_3_vars_graph(s2_func.clone())?;
+    let gv3 = output_stage_3_vars_graph(s3_func.clone())?;
 
     log::info!("finished - waiting for graphviz/dot");
     for mut proc in IntoIterator::into_iter([gv1, gv2, gv3]) {

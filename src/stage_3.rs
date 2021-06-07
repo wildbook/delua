@@ -11,7 +11,7 @@ pub type Location = (BlockId, usize);
 #[derive(Shrinkwrap, Debug, Eq, PartialEq, Clone, Copy, PartialOrd, Ord, Hash)]
 pub struct BlockId(pub s2::InstructionRef);
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Function {
     pub name: Option<String>,
     pub blocks: BTreeMap<BlockId, Block>,
@@ -825,7 +825,7 @@ impl Function {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Constant {
     Nil,
     Bool(bool),
