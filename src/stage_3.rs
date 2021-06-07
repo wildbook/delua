@@ -409,9 +409,8 @@ impl Function {
         let mut usage_to_var: HashMap<(s2::ArgDir, s2::ArgSlot, Location), VariableId> =
             HashMap::new();
 
-        // A map to let us track collisions.
-        // Each key maps to the id it collided into, but the reverse is not true.
-        let mut collisions = HashMap::<VariableId, VariableId>::new();
+        // A set to let us track collisions.
+        let mut collisions = HashSet::<(VariableId, VariableId)>::new();
 
         // For each variable, register all of its write/read/mod locations.
         // This allows us to later check for overlap and merge any overlapping variables.
@@ -422,8 +421,7 @@ impl Function {
                     .entry((dir, var.arg, origin))
                     .and_modify(|x| {
                         if var.id != *x {
-                            // TODO: Check if multiple collisions with the same variable can happen
-                            collisions.insert(var.id, *x).expect("can this happen?");
+                            collisions.insert((var.id, *x));
                         }
                     })
                     .or_insert(var.id);
