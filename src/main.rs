@@ -3,8 +3,10 @@
 
 use std::collections::HashMap;
 use std::io::{BufWriter, Cursor, Write};
+use std::path::PathBuf;
 
 use itertools::Itertools;
+use structopt::StructOpt;
 
 use crate::stage_2::{Arg, ArgDir, ArgSlot, OpInfo};
 
@@ -27,8 +29,8 @@ fn escape(s: String) -> String {
 }
 
 /// Example function that takes a `stage_2::Function` and outputs some trace info.
-fn output_stage_2_trace(top: stage_2::Function) {
-    let mut stack = vec![top.clone()];
+fn output_stage_2_trace(func: stage_2::Function) {
+    let mut stack = vec![func.clone()];
     while let Some(func) = stack.pop() {
         let block = func.blocks();
         log::trace!("|blocks");
@@ -43,13 +45,15 @@ fn output_stage_2_trace(top: stage_2::Function) {
 
 /// Example function that takes a `stage_2::Function` and outputs a graph.
 fn output_stage_2_graph(
-    top: stage_2::Function,
+    opt: &Opt,
+    func: stage_2::Function,
 ) -> Result<std::process::Child, Box<dyn std::error::Error>> {
-    let mut out = BufWriter::new(std::fs::File::create("output.dot")?);
+    let out_path = opt.output_dir.with_file_name("output_s2_graph.dot");
+    let mut out = BufWriter::new(std::fs::File::create(&out_path)?);
     writeln!(out, "digraph L {{")?;
 
     let mut i = 0;
-    let mut stack = vec![top.clone()];
+    let mut stack = vec![func.clone()];
     while let Some(func) = stack.pop() {
         writeln!(out, "subgraph fn_{} {{", i)?;
         writeln!(out, "  node [shape=record fontname=Consolas];")?;
@@ -91,14 +95,16 @@ fn output_stage_2_graph(
     out.flush()?;
     drop(out);
 
-    Ok(std::process::Command::new("dot").arg("output.dot").arg("-O").arg("-Tsvg").spawn()?)
+    Ok(std::process::Command::new("dot").arg(out_path).arg("-O").arg("-Tsvg").spawn()?)
 }
 
 /// Example function that takes a `stage_3::Function` and outputs a graph.
 fn output_stage_3_graph(
+    opt: &Opt,
     func: stage_3::Function,
 ) -> Result<std::process::Child, Box<dyn std::error::Error>> {
-    let mut out = BufWriter::new(std::fs::File::create("output_lifted.dot")?);
+    let out_path = opt.output_dir.with_file_name("output_s3_graph.dot");
+    let mut out = BufWriter::new(std::fs::File::create(&out_path)?);
 
     writeln!(out, "digraph L {{")?;
     writeln!(out, "  graph [splines=ortho, packmode=\"cluster\"]")?;
@@ -176,14 +182,16 @@ fn output_stage_3_graph(
 
     drop(out);
 
-    Ok(std::process::Command::new("dot").arg("output_lifted.dot").arg("-O").arg("-Tsvg").spawn()?)
+    Ok(std::process::Command::new("dot").arg(out_path).arg("-O").arg("-Tsvg").spawn()?)
 }
 
 /// Example function that takes a `stage_3::Function`, tries to recreate variables, then outputs a graph.
 fn output_stage_3_vars_graph(
+    opt: &Opt,
     func: stage_3::Function,
 ) -> Result<std::process::Child, Box<dyn std::error::Error>> {
-    let mut out = BufWriter::new(std::fs::File::create("output_lifted_vars.dot")?);
+    let out_path = opt.output_dir.with_file_name("output_s3_vars_graph.dot");
+    let mut out = BufWriter::new(std::fs::File::create(&out_path)?);
 
     writeln!(out, "digraph L {{")?;
     writeln!(out, "  graph [splines=ortho, packmode=\"cluster\"]")?;
@@ -323,41 +331,55 @@ fn output_stage_3_vars_graph(
 
     drop(out);
 
-    Ok(std::process::Command::new("dot")
-        .arg("output_lifted_vars.dot")
-        .arg("-O")
-        .arg("-Tsvg")
-        .spawn()?)
+    Ok(std::process::Command::new("dot").arg(out_path).arg("-O").arg("-Tsvg").spawn()?)
+}
+
+#[derive(Debug, StructOpt)]
+#[structopt(name = "example", about = "An example of StructOpt usage.")]
+struct Opt {
+    #[structopt(parse(from_os_str))]
+    input: PathBuf,
+
+    #[structopt(parse(from_os_str), default_value = "./output/")]
+    output_dir: PathBuf,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
-    let file = std::env::args().nth(1).unwrap_or_else(|| "aram.luabin".to_string());
+
+    let mut opt = Opt::from_args();
+
+    // Create any missing directories in the output path.
+    std::fs::create_dir_all(&opt.output_dir)?;
+
+    // Push a filename, or we'll edit the directory name later.
+    opt.output_dir.push("output");
 
     log::info!("reading file to bytes");
-    let buffer = std::fs::read(file)?;
+    let buffer = std::fs::read(&opt.input)?;
     let mut cursor = Cursor::new(buffer);
 
     log::info!("reading LuaFile");
     let s1_file = stage_1::LuaFile::read(&mut cursor)?;
+    let s1_func = &s1_file.top_level_func;
 
     log::info!("parsing top level function");
-    let s2_func = stage_2::Function::parse(&s1_file.top_level_func);
+    let s2_func = stage_2::Function::lift(s1_func);
 
     log::info!("executing output_stage_1");
     output_stage_2_trace(s2_func.clone());
 
     log::info!("executing output_stage_2");
-    let gv1 = output_stage_2_graph(s2_func.clone())?;
+    let gv1 = output_stage_2_graph(&opt, s2_func.clone())?;
 
     let mut s3_func = stage_3::Function::lift(s2_func.clone()).with_name("Entrypoint");
     dbg!(s3_func.optimize_until_complete());
 
     log::info!("executing output_stage_3");
-    let gv2 = output_stage_3_graph(s3_func.clone())?;
+    let gv2 = output_stage_3_graph(&opt, s3_func.clone())?;
 
     log::info!("executing output_stage_3_vars");
-    let gv3 = output_stage_3_vars_graph(s3_func.clone())?;
+    let gv3 = output_stage_3_vars_graph(&opt, s3_func)?;
 
     log::info!("finished - waiting for graphviz/dot");
     for mut proc in IntoIterator::into_iter([gv1, gv2, gv3]) {

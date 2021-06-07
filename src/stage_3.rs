@@ -119,16 +119,19 @@ impl Variable {
 }
 
 impl Function {
-    pub fn lift(p: s2::Function<'_>) -> Function {
+    pub fn lift(func: s2::Function<'_>) -> Function {
         // Generate and lift all blocks
-        let mut blocks: BTreeMap<_, _> =
-            p.blocks().into_iter().map(|(id, block)| (BlockId(id), Block::lift(block))).collect();
+        let mut blocks: BTreeMap<_, _> = func
+            .blocks()
+            .into_iter()
+            .map(|(id, block)| (BlockId(id), Block::lift(block)))
+            .collect();
 
         // Lift all constants
-        let constants: Vec<_> = p.constants.iter().copied().map(Constant::lift).collect();
+        let constants: Vec<_> = func.constants.iter().copied().map(Constant::lift).collect();
 
         // Lift all inner functions
-        let children = p.prototypes.into_iter().map(Function::lift).collect();
+        let children = func.prototypes.into_iter().map(Function::lift).collect();
 
         // Find all slots used by the function, they're used mainly in the code below
         let mut slots = HashSet::new();
@@ -172,7 +175,7 @@ impl Function {
             //
             // If / when we get rid of the explicit ExtOpCode::DefineReg instructions below, this
             // code can also be thrown out.
-            let arg_count = p.raw.arg_count as _;
+            let arg_count = func.raw.arg_count as _;
             if 0 < arg_count {
                 mark_opcs.push(s2::ExtOpCode::comment(format!("args: {}", arg_count)).into());
                 for reg in 0..arg_count {
@@ -207,8 +210,8 @@ impl Function {
             blocks,
             children,
             constants,
-            count_upvals: p.raw.up_val_count,
-            count_args: p.raw.arg_count,
+            count_upvals: func.raw.up_val_count,
+            count_args: func.raw.arg_count,
             used_slots: slots,
         }
     }

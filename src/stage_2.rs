@@ -795,14 +795,14 @@ pub struct Function<'a> {
 
 impl<'a> Function<'a> {
     /// Parse a raw `LuaFunction`
-    pub fn parse(raw: &'a s1::LuaFunction) -> Function {
+    pub fn lift(s1_func: &'a s1::LuaFunction) -> Function {
         // Collect all raw instructions and parse them into their stage_2 representation
-        let mut instructions = raw
+        let mut instructions = s1_func
             .instructions
             .0
             .iter()
             .enumerate()
-            .map(|(index, i)| Instruction::parse(&raw, i, index))
+            .map(|(index, i)| Instruction::parse(&s1_func, i, index))
             .collect::<Vec<_>>();
 
         // Keep track of all jumps. They're almost always just "go to next instruction" but we're
@@ -836,10 +836,10 @@ impl<'a> Function<'a> {
         }
 
         // Collect prototypes and constants for later use.
-        let prototypes = raw.prototypes.0.iter().map(Function::parse).collect();
-        let constants = raw.constants.0.iter().collect();
+        let prototypes = s1_func.prototypes.0.iter().map(Function::lift).collect();
+        let constants = s1_func.constants.0.iter().collect();
 
-        Function { raw, prototypes, instructions, constants }
+        Function { raw: s1_func, prototypes, instructions, constants }
     }
 
     /// Get an instruction by its reference.
